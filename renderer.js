@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════
-// AppUploadAnh — Renderer
+// Snap Drive — Renderer
 // ═══════════════════════════════════════════
 
 const $ = (sel) => document.querySelector(sel);

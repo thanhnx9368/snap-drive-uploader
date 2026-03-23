@@ -26,7 +26,7 @@ function createWindow() {
     height: 830,
     minWidth: 800,
     minHeight: 600,
-    title: 'AppUploadAnh',
+    title: 'Snap Drive',
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#0a0a1a',
     webPreferences: {

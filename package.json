@@ -1,14 +1,52 @@
 {
-  "name": "app-upload-anh",
+  "name": "snap-drive",
   "version": "1.0.0",
-  "description": "Auto upload images from a local folder to Google Drive using rclone",
+  "description": "Auto upload images from a local folder to Google Drive — by Snappy Studio",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:dmg": "electron-builder --mac dmg",
+    "build": "electron-builder"
   },
-  "author": "",
+  "author": "Snappy Studio",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^41.0.3"
+    "electron": "^41.0.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.snappy.snapdrive",
+    "productName": "Snap Drive",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "styles.css"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.icns"
+    },
+    "dmg": {
+      "title": "Snap Drive",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
   }
 }
