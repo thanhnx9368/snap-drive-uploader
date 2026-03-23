@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AppUploadAnh</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="drag-region"></div>
+
+  <div class="app-container">
+    <header class="app-header">
+      <div class="app-title">
+        <span class="app-icon">☁️</span>
+        <h1>AppUploadAnh</h1>
+      </div>
+      <div class="step-indicator">
+        <span id="step-ind-1" class="step-dot active">1</span>
+        <span class="step-line"></span>
+        <span id="step-ind-2" class="step-dot">2</span>
+      </div>
+    </header>
+
+    <!-- ═══ STEP 1: Setup ═══ -->
+    <div id="step-setup" class="step-panel">
+      <section class="card setup-card">
+        <h2 class="section-title">⚙️ Thiết lập & Cấu hình</h2>
+        <p class="setup-desc">Kiểm tra rclone đã được cài đặt và kết nối Google Drive.</p>
+
+        <div class="check-list">
+          <div class="check-item" id="check-installed">
+            <div class="check-icon"><span class="check-spinner"></span></div>
+            <div class="check-content">
+              <div class="check-title">rclone đã cài đặt</div>
+              <div class="check-detail" id="check-installed-detail">Đang kiểm tra...</div>
+            </div>
+            <div class="check-action">
+              <button id="btn-install-help" class="btn btn-ghost btn-sm hidden">Hướng dẫn</button>
+            </div>
+          </div>
+
+          <div class="check-item" id="check-remote">
+            <div class="check-icon"><span class="check-pending">○</span></div>
+            <div class="check-content">
+              <div class="check-title">Remote "drive" (Google Drive)</div>
+              <div class="check-detail" id="check-remote-detail">Chờ kiểm tra...</div>
+            </div>
+            <div class="check-action">
+              <button id="btn-create-remote" class="btn btn-primary btn-sm hidden">Tạo kết nối</button>
+            </div>
+          </div>
+
+          <div class="check-item" id="check-connection">
+            <div class="check-icon"><span class="check-pending">○</span></div>
+            <div class="check-content">
+              <div class="check-title">Kết nối Google Drive</div>
+              <div class="check-detail" id="check-connection-detail">Chờ kiểm tra...</div>
+            </div>
+            <div class="check-action">
+              <button id="btn-reconnect" class="btn btn-primary btn-sm hidden">Kết nối lại</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="config-output-panel" class="config-output-panel hidden">
+          <div class="config-output-header">
+            <span>📟 Kết quả cấu hình</span>
+            <button id="btn-close-output" class="btn btn-ghost btn-sm">✕</button>
+          </div>
+          <div id="config-output" class="config-output"></div>
+        </div>
+
+        <div class="setup-actions">
+          <button id="btn-recheck" class="btn btn-secondary">
+            <span class="btn-icon">🔄</span> Kiểm tra lại
+          </button>
+          <button id="btn-reconfigure" class="btn btn-secondary hidden">
+            <span class="btn-icon">🔁</span> Đổi tài khoản Google
+          </button>
+          <button id="btn-continue" class="btn btn-primary btn-lg" disabled>
+            Tiếp tục <span class="btn-icon">→</span>
+          </button>
+        </div>
+
+        <div id="install-instructions" class="info-box hidden">
+          <h3>📦 Hướng dẫn cài đặt rclone</h3>
+          <p><strong>macOS</strong> (dùng Homebrew):</p>
+          <code class="code-block">brew install rclone</code>
+          <p>Hoặc tải trực tiếp:</p>
+          <a href="#" id="link-rclone" class="download-link">🔗 https://rclone.org/downloads/</a>
+          <p style="margin-top:12px; color: var(--text-secondary);">Sau khi cài xong, nhấn <strong>"Kiểm tra lại"</strong>.</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- ═══ STEP 2: Upload ═══ -->
+    <div id="step-upload" class="step-panel hidden">
+      <div class="upload-header">
+        <button id="btn-back-setup" class="btn btn-ghost btn-sm">← Thiết lập</button>
+        <div class="status-badge" id="status-badge">
+          <span class="status-dot"></span>
+          <span id="status-text">Đã dừng</span>
+        </div>
+      </div>
+
+      <div class="main-grid">
+        <!-- Left: Config -->
+        <section class="config-panel card">
+          <h2 class="section-title">📂 Cấu hình Upload</h2>
+
+          <div class="field-group">
+            <label class="field-label">Folder theo dõi</label>
+            <div class="folder-selector">
+              <input type="text" id="folder-path" class="input-field" placeholder="Chưa chọn folder" readonly>
+              <button id="btn-select-folder" class="btn btn-secondary">
+                <span class="btn-icon">📁</span> Chọn
+              </button>
+            </div>
+            <!-- Previous session info shown here -->
+            <div id="folder-log-info" class="folder-log-info hidden"></div>
+            <p id="folder-error" class="error-text hidden"></p>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label">Link Google Drive Folder</label>
+            <input type="text" id="drive-link" class="input-field" placeholder="https://drive.google.com/drive/folders/...">
+            <div id="drive-id-display" class="id-display hidden">
+              <span class="id-label">Folder ID:</span>
+              <span id="drive-id-text" class="id-value"></span>
+            </div>
+            <div id="access-status" class="access-status hidden"></div>
+            <p id="drive-error" class="error-text hidden"></p>
+          </div>
+
+          <!-- Options -->
+          <div class="options-row">
+            <div class="field-group option-item">
+              <label class="checkbox-label">
+                <input type="checkbox" id="auto-retry" checked>
+                <span class="checkbox-custom"></span>
+                Tự động thử lại file lỗi
+              </label>
+            </div>
+            <div class="field-group option-item">
+              <label class="checkbox-label">
+                <input type="checkbox" id="overwrite">
+                <span class="checkbox-custom"></span>
+                Upload đè (overwrite)
+              </label>
+            </div>
+            <div class="field-group option-item">
+              <label class="checkbox-label">
+                <input type="checkbox" id="auto-sleep">
+                <span class="checkbox-custom"></span>
+                Tự sleep khi xong
+              </label>
+              <div id="sleep-config" class="sleep-config hidden">
+                <span class="sleep-label">Sau</span>
+                <select id="sleep-minutes" class="select-field">
+                  <option value="5">5</option>
+                  <option value="10" selected>10</option>
+                  <option value="15">15</option>
+                  <option value="30">30</option>
+                </select>
+                <span class="sleep-label">phút không có file mới</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Controls -->
+          <div class="controls">
+            <button id="btn-start" class="btn btn-primary btn-lg">
+              <span class="btn-icon">▶</span> Bắt đầu
+            </button>
+            <button id="btn-stop" class="btn btn-secondary btn-lg" disabled title="Dừng quét folder, upload hiện tại sẽ chạy xong">
+              <span class="btn-icon">⏸</span> Dừng quét
+            </button>
+            <button id="btn-cancel" class="btn btn-danger btn-lg hidden" title="Huỷ upload đang chạy ngay lập tức">
+              <span class="btn-icon">🛑</span> Huỷ upload
+            </button>
+            <button id="btn-upload-now" class="btn btn-accent btn-lg" disabled>
+              <span class="btn-icon">⬆</span> Upload ngay
+            </button>
+          </div>
+        </section>
+
+        <!-- Right: Stats -->
+        <section class="stats-panel card">
+          <h2 class="section-title">📊 Thống kê</h2>
+          <div class="stats-grid">
+            <div class="stat-card stat-total">
+              <div class="stat-value" id="stat-total">0</div>
+              <div class="stat-label">Tổng file</div>
+            </div>
+            <div class="stat-card stat-cumulative">
+              <div class="stat-value" id="stat-cumulative">0</div>
+              <div class="stat-label">Đã upload (tổng)</div>
+            </div>
+            <div class="stat-card stat-session">
+              <div class="stat-value" id="stat-session">0</div>
+              <div class="stat-label">Upload lần này</div>
+            </div>
+            <div class="stat-card stat-remaining">
+              <div class="stat-value" id="stat-remaining">0</div>
+              <div class="stat-label">Còn lại</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Logs -->
+      <section class="logs-panel card">
+        <div class="logs-header">
+          <h2 class="section-title">📋 Nhật ký</h2>
+          <button id="btn-clear-logs" class="btn btn-ghost btn-sm">Xoá</button>
+        </div>
+        <div id="log-container" class="log-container">
+          <div class="log-empty">Chờ hoạt động...</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

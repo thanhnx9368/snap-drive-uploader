@@ -1,0 +1,14 @@
+{
+  "name": "app-upload-anh",
+  "version": "1.0.0",
+  "description": "Auto upload images from a local folder to Google Drive using rclone",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^41.0.3"
+  }
+}
