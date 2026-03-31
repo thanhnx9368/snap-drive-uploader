@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════
-// Snap Drive — Renderer
+// Snappy Drive — Renderer
 // ═══════════════════════════════════════════
 
 const $ = (sel) => document.querySelector(sel);
@@ -52,6 +52,7 @@ const btnStop = $('#btn-stop');
 const btnCancel = $('#btn-cancel');
 const btnUploadNow = $('#btn-upload-now');
 const btnClearLogs = $('#btn-clear-logs');
+const btnReset = $('#btn-reset');
 
 const statTotal = $('#stat-total');
 const statCumulative = $('#stat-cumulative');
@@ -64,6 +65,31 @@ let selectedFolder = '';
 let extractedFolderId = '';
 let isRunning = false;
 let folderAccessVerified = false;
+
+// ─── Reset all state ──────────────────────
+function resetAll() {
+  // Clear logs
+  logContainer.innerHTML = '<div class="log-empty">Chờ hoạt động...</div>';
+
+  // Reset stats
+  statTotal.textContent = '0';
+  statCumulative.textContent = '0';
+  statSession.textContent = '0';
+  statRemaining.textContent = '0';
+
+  // Clear drive link
+  driveLinkInput.value = '';
+  extractedFolderId = '';
+  driveIdDisplay.classList.add('hidden');
+  driveError.classList.add('hidden');
+  accessStatus.classList.add('hidden');
+  folderAccessVerified = false;
+
+  // Clear folder log info
+  folderLogInfo.innerHTML = '';
+  folderLogInfo.classList.add('hidden');
+  folderError.classList.add('hidden');
+}
 
 // ═══════════════════════════════════════════
 // STEP 1: Setup
@@ -226,7 +252,9 @@ btnSelectFolder.addEventListener('click', async () => {
   if (path) {
     selectedFolder = path;
     folderPathInput.value = path;
-    folderError.classList.add('hidden');
+
+    // Reset everything for the new folder
+    resetAll();
 
     // Read log from folder to preview stats
     const logInfo = await window.api.readFolderLog(path);
@@ -344,6 +372,13 @@ btnClearLogs.addEventListener('click', () => {
   logContainer.innerHTML = '<div class="log-empty">Chờ hoạt động...</div>';
 });
 
+btnReset.addEventListener('click', () => {
+  if (isRunning) return;
+  selectedFolder = '';
+  folderPathInput.value = '';
+  resetAll();
+});
+
 function setRunningState(running) {
   isRunning = running;
   btnStart.disabled = running;
@@ -353,6 +388,7 @@ function setRunningState(running) {
   btnSelectFolder.disabled = running;
   driveLinkInput.disabled = running;
   btnBackSetup.disabled = running;
+  btnReset.disabled = running;
   autoSleepCheckbox.disabled = running;
   sleepMinutesSelect.disabled = running;
   overwriteCheckbox.disabled = running;

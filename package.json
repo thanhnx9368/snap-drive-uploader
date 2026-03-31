@@ -1,5 +1,5 @@
 {
-  "name": "snap-drive",
+  "name": "snappy-drive",
   "version": "1.0.0",
   "description": "Auto upload images from a local folder to Google Drive — by Snappy Studio",
   "main": "main.js",
@@ -16,8 +16,8 @@
     "electron-builder": "^26.0.12"
   },
   "build": {
-    "appId": "com.snappy.snapdrive",
-    "productName": "Snap Drive",
+    "appId": "com.snappy.snappydrive",
+    "productName": "Snappy Drive",
     "files": [
       "main.js",
       "preload.js",
@@ -34,7 +34,7 @@
       "icon": "build/icon.icns"
     },
     "dmg": {
-      "title": "Snap Drive",
+      "title": "Snappy Drive",
       "contents": [
         {
           "x": 130,

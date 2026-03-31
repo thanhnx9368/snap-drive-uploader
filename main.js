@@ -3,6 +3,13 @@ const path = require('path');
 const fs = require('fs');
 const { exec, spawn } = require('child_process');
 
+// Fix PATH for macOS .app bundles (Homebrew paths not inherited)
+const EXTRA_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/homebrew/sbin', '/usr/local/sbin'];
+const shellEnv = {
+  ...process.env,
+  PATH: [...EXTRA_PATHS, process.env.PATH].join(':'),
+};
+
 let mainWindow;
 let pollingInterval = null;
 let isMonitoring = false;
@@ -26,7 +33,7 @@ function createWindow() {
     height: 830,
     minWidth: 800,
     minHeight: 600,
-    title: 'Snap Drive',
+    title: 'Snappy Drive',
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#0a0a1a',
     webPreferences: {
@@ -277,7 +284,8 @@ class SessionLogger {
 const sessionLogger = new SessionLogger();
 
 // ─── File helpers ────────────────────────────────────────
-function hasRecentlyModifiedFiles(folderPath, thresholdMs = 5000) {
+function getWritingFiles(folderPath, thresholdMs = 5000) {
+  const writingFiles = [];
   try {
     const files = fs.readdirSync(folderPath);
     const now = Date.now();
@@ -285,11 +293,13 @@ function hasRecentlyModifiedFiles(folderPath, thresholdMs = 5000) {
       if (isIgnoredFile(f)) continue;
       try {
         const stat = fs.statSync(path.join(folderPath, f));
-        if (stat.isFile() && (now - stat.mtimeMs) < thresholdMs) return true;
+        if (stat.isFile() && (now - stat.mtimeMs) < thresholdMs) {
+          writingFiles.push(f);
+        }
       } catch { /* skip */ }
     }
-    return false;
-  } catch { return false; }
+  } catch { /* skip */ }
+  return writingFiles;
 }
 
 function countLocalFiles(folderPath) {
@@ -304,7 +314,7 @@ function countLocalFiles(folderPath) {
 
 function getRemoteFileCount(folderId) {
   return new Promise((resolve) => {
-    exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --files-only --exclude ".*"`, { timeout: 60000 }, (error, stdout) => {
+    exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --files-only --exclude ".*"`, { timeout: 60000, env: shellEnv }, (error, stdout) => {
       if (error) { resolve(0); return; }
       resolve(stdout.split('\n').filter(Boolean).length);
     });
@@ -312,7 +322,7 @@ function getRemoteFileCount(folderId) {
 }
 
 // ─── Upload with real-time progress ──────────────────────
-function runRcloneUpload(folderPath, folderId, overwrite = false) {
+function runRcloneUpload(folderPath, folderId, overwrite = false, excludeFiles = []) {
   return new Promise((resolve) => {
     const args = [
       'copy', folderPath, 'drive:',
@@ -323,8 +333,11 @@ function runRcloneUpload(folderPath, folderId, overwrite = false) {
       '-v', '--stats', '3s', '--stats-one-line',
     ];
     if (!overwrite) args.push('--ignore-existing');
+    for (const ef of excludeFiles) {
+      args.push('--exclude', ef);
+    }
 
-    const child = spawn('rclone', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('rclone', args, { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
     currentUploadProcess = child;
 
     let lastProgressLine = '';
@@ -421,13 +434,13 @@ async function scanAndUpload(config, retryCount = 0) {
     sendStats();
 
     // Log scan
-    const isStillWriting = hasRecentlyModifiedFiles(folderPath, 5000);
+    const writingFiles = getWritingFiles(folderPath, 5000);
+    const isStillWriting = writingFiles.length > 0;
     sessionLogger.logScan({ localFileCount: localCount, filesStillWriting: isStillWriting });
 
     if (isStillWriting) {
-      sendLog('⏳ Có file đang ghi, chờ lần quét tiếp...', 'warn');
-      sessionLogger.saveProgress();
-      return;
+      const stableCount = localCount - writingFiles.length;
+      sendLog(`⏳ ${writingFiles.length} file đang ghi, bỏ qua — upload ${stableCount} file đã ổn định`, 'info');
     }
 
     if (stats.remaining <= 0 && !config.overwrite) {
@@ -436,8 +449,15 @@ async function scanAndUpload(config, retryCount = 0) {
       return;
     }
 
+    // If ALL remaining files are still writing, skip this scan
+    if (isStillWriting && (localCount - writingFiles.length) <= stats.cumulativeUploaded && !config.overwrite) {
+      sendLog('⏳ Các file chưa upload đều đang ghi, chờ lần quét tiếp...', 'warn');
+      sessionLogger.saveProgress();
+      return;
+    }
+
     sendLog('🚀 Bắt đầu upload...', 'info');
-    const result = await runRcloneUpload(folderPath, folderId, config.overwrite);
+    const result = await runRcloneUpload(folderPath, folderId, config.overwrite, writingFiles);
 
     // Log result
     const remoteCount = await getRemoteFileCount(folderId);
@@ -484,7 +504,7 @@ function startSleepTimer(idleMinutes) {
     if (idleMs >= idleMinutes * 60 * 1000 && isMonitoring) {
       sendLog(`😴 Không có file mới trong ${idleMinutes} phút. Sleep máy...`, 'warn');
       stopMonitoring();
-      setTimeout(() => { exec('pmset sleepnow'); }, 3000);
+      setTimeout(() => { exec('pmset sleepnow', { env: shellEnv }); }, 3000);
     }
   }, 30000);
 }
@@ -546,7 +566,7 @@ ipcMain.handle('check-rclone-full', async () => {
   const result = { installed: false, version: null, remoteExists: false, connectionOk: false, errorDetail: '' };
   try {
     const version = await new Promise((resolve, reject) => {
-      exec('rclone version', (err, stdout) => {
+      exec('rclone version', { env: shellEnv }, (err, stdout) => {
         if (err) reject(err);
         else { const m = stdout.match(/rclone v([^\s]+)/); resolve(m ? m[1] : 'unknown'); }
       });
@@ -556,7 +576,7 @@ ipcMain.handle('check-rclone-full', async () => {
 
   try {
     const remotes = await new Promise((resolve, reject) => {
-      exec('rclone listremotes', (err, stdout) => { if (err) reject(err); else resolve(stdout); });
+      exec('rclone listremotes', { env: shellEnv }, (err, stdout) => { if (err) reject(err); else resolve(stdout); });
     });
     const list = remotes.split('\n').map(r => r.trim()).filter(Boolean);
     result.remoteExists = list.includes('drive:');
@@ -568,7 +588,7 @@ ipcMain.handle('check-rclone-full', async () => {
 
   try {
     await new Promise((resolve, reject) => {
-      exec('rclone about drive:', { timeout: 30000 }, (err, stdout) => { if (err) reject(err); else resolve(stdout); });
+      exec('rclone about drive:', { timeout: 30000, env: shellEnv }, (err, stdout) => { if (err) reject(err); else resolve(stdout); });
     });
     result.connectionOk = true;
   } catch { result.errorDetail = 'Kết nối Google Drive thất bại. Token có thể đã hết hạn.'; }
@@ -577,7 +597,7 @@ ipcMain.handle('check-rclone-full', async () => {
 
 ipcMain.handle('create-drive-remote', async () => {
   return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
     let out = '', err = '';
     child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
     child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
@@ -587,9 +607,9 @@ ipcMain.handle('create-drive-remote', async () => {
 });
 
 ipcMain.handle('reconfigure-drive-remote', async () => {
-  await new Promise((r) => exec('rclone config delete drive', () => r()));
+  await new Promise((r) => exec('rclone config delete drive', { env: shellEnv }, () => r()));
   return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
     let out = '', err = '';
     child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
     child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
@@ -600,7 +620,7 @@ ipcMain.handle('reconfigure-drive-remote', async () => {
 
 ipcMain.handle('reconnect-drive-remote', async () => {
   return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'reconnect', 'drive:'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('rclone', ['config', 'reconnect', 'drive:'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
     let out = '', err = '';
     child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
     child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
@@ -614,7 +634,7 @@ ipcMain.handle('open-url', (_, url) => shell.openExternal(url));
 ipcMain.handle('check-folder-access', async (_, folderId) => {
   try {
     await new Promise((resolve, reject) => {
-      exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --max-depth 1`, { timeout: 15000 }, (err, stdout) => {
+      exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --max-depth 1`, { timeout: 15000, env: shellEnv }, (err, stdout) => {
         if (err) reject(err); else resolve(stdout);
       });
     });
