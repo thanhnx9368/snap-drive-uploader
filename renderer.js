@@ -376,6 +376,11 @@ btnReset.addEventListener('click', () => {
   if (isRunning) return;
   selectedFolder = '';
   folderPathInput.value = '';
+  autoRetryCheckbox.checked = true;
+  overwriteCheckbox.checked = false;
+  autoSleepCheckbox.checked = false;
+  sleepMinutesSelect.value = "10";
+  sleepConfig.classList.add('hidden');
   resetAll();
 });
 

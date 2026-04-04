@@ -51,6 +51,11 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 
 // ─── Helpers ─────────────────────────────────────────────
 function getLogDir() {
+  if (currentConfig && currentConfig.folderPath) {
+    const dir = path.join(currentConfig.folderPath, 'upload-logs');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
   const dir = path.join(app.getPath('userData'), 'logs');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
@@ -109,7 +114,7 @@ class SessionLogger {
   }
 
   init(folderPath) {
-    this.logFilePath = path.join(folderPath, '.appuploadanh-log.json');
+    this.logFilePath = path.join(folderPath, 'appuploadanh-log.json');
     try {
       if (fs.existsSync(this.logFilePath)) {
         const data = JSON.parse(fs.readFileSync(this.logFilePath, 'utf-8'));
@@ -302,14 +307,26 @@ function getWritingFiles(folderPath, thresholdMs = 5000) {
   return writingFiles;
 }
 
-function countLocalFiles(folderPath) {
+function getUnuploadedLocalFilesCount(folderPath, uploadedFilesMap) {
+  let count = 0;
+  let total = 0;
   try {
-    return fs.readdirSync(folderPath).filter(f => {
-      if (isIgnoredFile(f)) return false;
-      try { return fs.statSync(path.join(folderPath, f)).isFile(); }
-      catch { return false; }
-    }).length;
-  } catch { return 0; }
+    const files = fs.readdirSync(folderPath);
+    for (const f of files) {
+      if (isIgnoredFile(f)) continue;
+      try {
+        if (fs.statSync(path.join(folderPath, f)).isFile()) {
+           total++;
+           if (!uploadedFilesMap[f]) count++;
+        }
+      } catch { }
+    }
+  } catch {}
+  return { total, unuploaded: count };
+}
+
+function countLocalFiles(folderPath) {
+  return getUnuploadedLocalFilesCount(folderPath, {}).total;
 }
 
 function getRemoteFileCount(folderId) {
@@ -330,7 +347,10 @@ function runRcloneUpload(folderPath, folderId, overwrite = false, excludeFiles =
       '--exclude', '.*',
       '--exclude', 'Thumbs.db',
       '--exclude', 'desktop.ini',
-      '-v', '--stats', '3s', '--stats-one-line',
+      '-v', '--stats', '3s',
+      '--tpslimit', '10',
+      '--transfers', '4',
+      '--drive-chunk-size', '64M'
     ];
     if (!overwrite) args.push('--ignore-existing');
     for (const ef of excludeFiles) {
@@ -341,6 +361,7 @@ function runRcloneUpload(folderPath, folderId, overwrite = false, excludeFiles =
     currentUploadProcess = child;
 
     let lastProgressLine = '';
+    let currentTransferringFile = null;
     let transferredCount = 0;
     let hasError = false;
     const uploadStartTime = Date.now();
@@ -381,11 +402,18 @@ function runRcloneUpload(folderPath, folderId, overwrite = false, excludeFiles =
             let progressMsg = `📤 ${done}/${total} file`;
             if (speedMatch) progressMsg += ` | ${speedMatch[1]}`;
             if (etaMatch) progressMsg += ` | ETA ${etaMatch[1]}`;
+            if (currentTransferringFile) {
+              progressMsg += ` | ⏳ ${currentTransferringFile}`;
+            }
             if (progressMsg !== lastProgressLine) {
               lastProgressLine = progressMsg;
               sendLog(progressMsg, 'info');
+              currentTransferringFile = null; // Clear to wait for next file update
             }
           }
+        } else if (line.trim().startsWith('* ') && line.includes(':')) {
+          const fileMatch = line.match(/\*\s+([^:]+):/);
+          if (fileMatch) currentTransferringFile = fileMatch[1].trim();
         } else if (line.includes('ERROR')) {
           hasError = true;
           const errMatch = line.match(/:\s+(.+?):\s+(.+)/);
@@ -427,10 +455,10 @@ async function scanAndUpload(config, retryCount = 0) {
       return;
     }
 
-    const localCount = countLocalFiles(folderPath);
+    const { total: localCount, unuploaded: unuploadedCount } = getUnuploadedLocalFilesCount(folderPath, sessionLogger.logData.uploadedFiles || {});
     stats.total = localCount;
-    stats.remaining = Math.max(0, localCount - stats.cumulativeUploaded);
-    sendLog(`📁 Quét folder: ${localCount} file (đã upload: ${stats.cumulativeUploaded}, còn: ${stats.remaining})`);
+    stats.remaining = unuploadedCount;
+    sendLog(`📁 Quét folder: ${localCount} file (đã upload: ${stats.cumulativeUploaded}, cần up mới: ${stats.remaining})`);
     sendStats();
 
     // Log scan
@@ -450,7 +478,7 @@ async function scanAndUpload(config, retryCount = 0) {
     }
 
     // If ALL remaining files are still writing, skip this scan
-    if (isStillWriting && (localCount - writingFiles.length) <= stats.cumulativeUploaded && !config.overwrite) {
+    if (isStillWriting && (unuploadedCount - writingFiles.length) <= 0 && !config.overwrite) {
       sendLog('⏳ Các file chưa upload đều đang ghi, chờ lần quét tiếp...', 'warn');
       sessionLogger.saveProgress();
       return;
@@ -525,7 +553,7 @@ function stopMonitoring() {
 
 // ─── IPC: Read log from folder ───────────────────────────
 ipcMain.handle('read-folder-log', (_, folderPath) => {
-  const logPath = path.join(folderPath, '.appuploadanh-log.json');
+  const logPath = path.join(folderPath, 'appuploadanh-log.json');
   try {
     if (fs.existsSync(logPath)) {
       const data = JSON.parse(fs.readFileSync(logPath, 'utf-8'));
@@ -547,18 +575,19 @@ ipcMain.handle('read-folder-log', (_, folderPath) => {
       }
 
       const cumulativeUploaded = Object.keys(uploadedFiles).length;
-      const localCount = countLocalFiles(folderPath);
+      const { total: localCount, unuploaded: unuploadedCount } = getUnuploadedLocalFilesCount(folderPath, uploadedFiles);
       const totalSessions = (data.sessions || []).length;
       return {
         hasLog: true,
         cumulativeUploaded,
         localCount,
-        remaining: Math.max(0, localCount - cumulativeUploaded),
+        remaining: unuploadedCount,
         totalSessions,
       };
     }
   } catch { /* skip */ }
-  return { hasLog: false, cumulativeUploaded: 0, localCount: countLocalFiles(folderPath), remaining: 0, totalSessions: 0 };
+  const localCount = countLocalFiles(folderPath);
+  return { hasLog: false, cumulativeUploaded: 0, localCount, remaining: localCount, totalSessions: 0 };
 });
 
 // ─── IPC: Setup checks ──────────────────────────────────
@@ -682,7 +711,7 @@ ipcMain.handle('start-monitoring', (_, config) => {
     sendLog(`📊 Phiên trước: đã upload ${prevUploaded}/${localCount} file`, 'info');
   }
   if (config.overwrite) sendLog('⚠️ Chế độ upload đè (overwrite) đang BẬT', 'warn');
-  sendLog('📝 Log file: .appuploadanh-log.json', 'info');
+  sendLog('📝 Log file: appuploadanh-log.json', 'info');
   sendStats();
 
   scanAndUpload(config);
