@@ -1,233 +1,306 @@
 <!DOCTYPE html>
 <html lang="vi">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: snappy:">
   <title>Snappy Drive</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
+
 <body>
-  <div class="drag-region"></div>
-
-  <div class="app-container">
-    <header class="app-header">
-      <div class="app-title">
-        <span class="app-icon">☁️</span>
-        <h1>Snappy Drive</h1>
-      </div>
-      <div class="step-indicator">
-        <span id="step-ind-1" class="step-dot active">1</span>
-        <span class="step-line"></span>
-        <span id="step-ind-2" class="step-dot">2</span>
-      </div>
-    </header>
-
-    <!-- ═══ STEP 1: Setup ═══ -->
-    <div id="step-setup" class="step-panel">
-      <section class="card setup-card">
-        <h2 class="section-title">⚙️ Thiết lập & Cấu hình</h2>
-        <p class="setup-desc">Kiểm tra rclone đã được cài đặt và kết nối Google Drive.</p>
-
-        <div class="check-list">
-          <div class="check-item" id="check-installed">
-            <div class="check-icon"><span class="check-spinner"></span></div>
-            <div class="check-content">
-              <div class="check-title">rclone đã cài đặt</div>
-              <div class="check-detail" id="check-installed-detail">Đang kiểm tra...</div>
-            </div>
-            <div class="check-action">
-              <button id="btn-install-help" class="btn btn-ghost btn-sm hidden">Hướng dẫn</button>
-            </div>
-          </div>
-
-          <div class="check-item" id="check-remote">
-            <div class="check-icon"><span class="check-pending">○</span></div>
-            <div class="check-content">
-              <div class="check-title">Remote "drive" (Google Drive)</div>
-              <div class="check-detail" id="check-remote-detail">Chờ kiểm tra...</div>
-            </div>
-            <div class="check-action">
-              <button id="btn-create-remote" class="btn btn-primary btn-sm hidden">Tạo kết nối</button>
-            </div>
-          </div>
-
-          <div class="check-item" id="check-connection">
-            <div class="check-icon"><span class="check-pending">○</span></div>
-            <div class="check-content">
-              <div class="check-title">Kết nối Google Drive</div>
-              <div class="check-detail" id="check-connection-detail">Chờ kiểm tra...</div>
-            </div>
-            <div class="check-action">
-              <button id="btn-reconnect" class="btn btn-primary btn-sm hidden">Kết nối lại</button>
-            </div>
-          </div>
-        </div>
-
-        <div id="config-output-panel" class="config-output-panel hidden">
-          <div class="config-output-header">
-            <span>📟 Kết quả cấu hình</span>
-            <button id="btn-close-output" class="btn btn-ghost btn-sm">✕</button>
-          </div>
-          <div id="config-output" class="config-output"></div>
-        </div>
-
-        <div class="setup-actions">
-          <button id="btn-recheck" class="btn btn-secondary">
-            <span class="btn-icon">🔄</span> Kiểm tra lại
-          </button>
-          <button id="btn-reconfigure" class="btn btn-secondary hidden">
-            <span class="btn-icon">🔁</span> Đổi tài khoản Google
-          </button>
-          <button id="btn-continue" class="btn btn-primary btn-lg" disabled>
-            Tiếp tục <span class="btn-icon">→</span>
-          </button>
-        </div>
-
-        <div id="install-instructions" class="info-box hidden">
-          <h3>📦 Hướng dẫn cài đặt rclone</h3>
-          <p><strong>macOS</strong> (dùng Homebrew):</p>
-          <code class="code-block">brew install rclone</code>
-          <p>Hoặc tải trực tiếp:</p>
-          <a href="#" id="link-rclone" class="download-link">🔗 https://rclone.org/downloads/</a>
-          <p style="margin-top:12px; color: var(--text-secondary);">Sau khi cài xong, nhấn <strong>"Kiểm tra lại"</strong>.</p>
-        </div>
-      </section>
+  <!-- ═══ Thanh tiêu đề ═══ -->
+  <header class="titlebar">
+    <div class="brand"><img src="assets/logo-mark.png" class="brand-logo" alt=""><span class="title">Snappy Drive</span></div>
+    <div class="titlebar-right">
+      <div class="status" id="status-pill"><span class="dot"></span><span id="status-text">Sẵn sàng</span></div>
+      <button id="btn-settings" class="tb-btn" title="Tài khoản Google Drive" aria-label="Tài khoản Google Drive">
+        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M10 12.8a2.8 2.8 0 1 0 0-5.6 2.8 2.8 0 0 0 0 5.6Zm7.1-1.9-1.5-.4a5.8 5.8 0 0 1-.5 1.2l.8 1.3-1.4 1.4-1.3-.8c-.4.2-.8.4-1.2.5l-.4 1.5H8.4L8 14.1a5.8 5.8 0 0 1-1.2-.5l-1.3.8-1.4-1.4.8-1.3a5.8 5.8 0 0 1-.5-1.2l-1.5-.4V9l1.5-.4c.1-.4.3-.8.5-1.2l-.8-1.3 1.4-1.4 1.3.8c.4-.2.8-.4 1.2-.5l.4-1.5h2l.4 1.5c.4.1.8.3 1.2.5l1.3-.8 1.4 1.4-.8 1.3c.2.4.4.8.5 1.2l1.5.4v2Z"/></svg>
+      </button>
     </div>
+  </header>
 
-    <!-- ═══ STEP 2: Upload ═══ -->
-    <div id="step-upload" class="step-panel hidden">
-      <div class="upload-header">
-        <button id="btn-back-setup" class="btn btn-ghost btn-sm">← Thiết lập</button>
-        <div class="status-badge" id="status-badge">
-          <span class="status-dot"></span>
-          <span id="status-text">Đã dừng</span>
-        </div>
+  <div class="shell">
+    <!-- ═══ Sidebar ═══ -->
+    <aside class="sidebar">
+      <div id="setup-alert" class="alert hidden">
+        <span id="setup-alert-text">Chưa kết nối Google Drive</span>
+        <button id="btn-open-setup" class="link-btn">Kết nối</button>
       </div>
 
-      <div class="main-grid">
-        <!-- Left: Config -->
-        <section class="config-panel card">
-          <h2 class="section-title">📂 Cấu hình Upload</h2>
-
-          <div class="field-group">
-            <label class="field-label">Folder theo dõi</label>
-            <div class="folder-selector">
-              <input type="text" id="folder-path" class="input-field" placeholder="Chưa chọn folder" readonly>
-              <button id="btn-select-folder" class="btn btn-secondary">
-                <span class="btn-icon">📁</span> Chọn
-              </button>
-            </div>
-            <!-- Previous session info shown here -->
-            <div id="folder-log-info" class="folder-log-info hidden"></div>
-            <p id="folder-error" class="error-text hidden"></p>
+      <div id="form-view" class="side-scroll">
+        <div class="group-label">Lưu vào Google Drive</div>
+        <div class="group">
+          <div id="month-pick" class="row hidden">
+            <span class="row-icon">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6l1.6 1.6H16a1.5 1.5 0 0 1 1.5 1.5v7.4A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"/></svg>
+            </span>
+            <select id="month-select" class="select" aria-label="Thư mục tháng"></select>
+            <button id="btn-month-menu" class="link-btn" title="Thêm tháng mới">Thêm</button>
           </div>
-
-          <div class="field-group">
-            <label class="field-label">Link Google Drive Folder</label>
-            <input type="text" id="drive-link" class="input-field" placeholder="https://drive.google.com/drive/folders/...">
-            <div id="drive-id-display" class="id-display hidden">
-              <span class="id-label">Folder ID:</span>
-              <span id="drive-id-text" class="id-value"></span>
+          <div id="month-add" class="month-add">
+            <input type="text" id="month-link" class="field" placeholder="Dán link thư mục tháng (VD: T11)">
+            <div class="month-add-row">
+              <input type="text" id="month-name" class="field" placeholder="Tên, VD T11/2026">
+              <button id="btn-save-month" class="btn btn-blue btn-small" disabled>Lưu</button>
+              <button id="btn-cancel-month" class="btn btn-small hidden">Huỷ</button>
             </div>
-            <div id="access-status" class="access-status hidden"></div>
-            <p id="drive-error" class="error-text hidden"></p>
+            <div id="month-status" class="note"></div>
           </div>
+        </div>
+        <div id="month-warning" class="warn hidden"></div>
+        <div id="month-actions" class="sub-actions hidden">
+          <button id="btn-open-month" class="link-btn">Mở thư mục tháng trên Drive</button>
+        </div>
 
-          <!-- Options -->
-          <div class="options-row">
-            <div class="field-group option-item">
-              <label class="checkbox-label">
-                <input type="checkbox" id="auto-retry" checked>
-                <span class="checkbox-custom"></span>
-                Tự động thử lại file lỗi
-              </label>
-            </div>
-            <div class="field-group option-item">
-              <label class="checkbox-label">
-                <input type="checkbox" id="overwrite">
-                <span class="checkbox-custom"></span>
-                Upload đè (overwrite)
-              </label>
-            </div>
-            <div class="field-group option-item">
-              <label class="checkbox-label">
-                <input type="checkbox" id="auto-sleep">
-                <span class="checkbox-custom"></span>
-                Tự sleep khi xong
-              </label>
-              <div id="sleep-config" class="sleep-config hidden">
-                <span class="sleep-label">Sau</span>
-                <select id="sleep-minutes" class="select-field">
-                  <option value="5">5</option>
-                  <option value="10" selected>10</option>
-                  <option value="15">15</option>
-                  <option value="30">30</option>
-                </select>
-                <span class="sleep-label">phút không có file mới</span>
-              </div>
-            </div>
+        <div id="client-group">
+          <div class="group-label">Buổi chụp</div>
+          <div class="group">
+            <label class="row">
+              <span class="row-label">Ngày chụp</span>
+              <input type="date" id="shoot-date" class="field field-inline">
+            </label>
+            <label class="row">
+              <span class="row-label">Tên khách</span>
+              <input type="text" id="dest-name" class="field field-inline" placeholder="Thôi nôi Bảo An">
+            </label>
+            <label class="row">
+              <span class="row-label">Số ảnh dự kiến</span>
+              <input type="number" id="expected-total" class="field field-inline field-num" min="0" placeholder="Tuỳ chọn">
+            </label>
           </div>
+          <div id="shoot-date-hint" class="note pad"></div>
+        </div>
+        <div id="path-preview" class="path hidden"></div>
 
-          <!-- Controls -->
-          <div class="controls">
-            <button id="btn-start" class="btn btn-primary btn-lg">
-              <span class="btn-icon">▶</span> Bắt đầu
-            </button>
-            <button id="btn-stop" class="btn btn-secondary btn-lg" disabled title="Dừng quét folder, upload hiện tại sẽ chạy xong">
-              <span class="btn-icon">⏸</span> Dừng quét
-            </button>
-            <button id="btn-cancel" class="btn btn-danger btn-lg hidden" title="Huỷ upload đang chạy ngay lập tức">
-              <span class="btn-icon">🛑</span> Huỷ upload
-            </button>
-            <button id="btn-upload-now" class="btn btn-accent btn-lg" disabled>
-              <span class="btn-icon">⬆</span> Upload ngay
-            </button>
-            <button id="btn-reset" class="btn btn-secondary btn-lg" title="Xoá tất cả dữ liệu cũ, nhập lại từ đầu">
-              <span class="btn-icon">🔄</span> Làm mới
-            </button>
+        <details id="advanced" class="advanced">
+          <summary>Tuỳ chọn nâng cao</summary>
+          <div class="group">
+            <label class="row toggle-row">
+              <span class="row-label">Upload thẳng vào thư mục đã chọn</span>
+              <input type="checkbox" id="direct-mode" class="switch">
+            </label>
+            <label class="row toggle-row">
+              <span class="row-label">Sleep máy sau khi xong</span>
+              <select id="sleep-minutes" class="select-mini">
+                <option value="5">5 phút</option>
+                <option value="10" selected>10 phút</option>
+                <option value="15">15 phút</option>
+                <option value="30">30 phút</option>
+              </select>
+              <input type="checkbox" id="auto-sleep" class="switch">
+            </label>
+            <label class="row toggle-row">
+              <span class="row-label">Chỉ upload từ mã ảnh</span>
+              <input type="text" id="start-from-file-input" class="field field-mini" placeholder="_NXT3311">
+              <input type="checkbox" id="start-from-file-checkbox" class="switch">
+            </label>
+            <label class="row toggle-row" title="Mặc định ảnh export lại sẽ tự thay bản cũ. Bật để thay cả file trùng tên có sẵn trên Drive.">
+              <span class="row-label">Đè file trùng tên trên Drive</span>
+              <input type="checkbox" id="overwrite" class="switch">
+            </label>
           </div>
-        </section>
-
-        <!-- Right: Stats -->
-        <section class="stats-panel card">
-          <h2 class="section-title">📊 Thống kê</h2>
-          <div class="stats-grid">
-            <div class="stat-card stat-total">
-              <div class="stat-value" id="stat-total">0</div>
-              <div class="stat-label">Tổng file</div>
-            </div>
-            <div class="stat-card stat-cumulative">
-              <div class="stat-value" id="stat-cumulative">0</div>
-              <div class="stat-label">Đã upload (tổng)</div>
-            </div>
-            <div class="stat-card stat-session">
-              <div class="stat-value" id="stat-session">0</div>
-              <div class="stat-label">Upload lần này</div>
-            </div>
-            <div class="stat-card stat-remaining">
-              <div class="stat-value" id="stat-remaining">0</div>
-              <div class="stat-label">Còn lại</div>
-            </div>
-          </div>
-        </section>
+        </details>
       </div>
 
-      <!-- Logs -->
-      <section class="logs-panel card">
-        <div class="logs-header">
-          <h2 class="section-title">📋 Nhật ký</h2>
-          <button id="btn-clear-logs" class="btn btn-ghost btn-sm">Xoá</button>
+      <!-- Khi đang chạy -->
+      <div id="run-view" class="side-scroll hidden">
+        <div class="group-label">Đang upload</div>
+        <div class="group">
+          <div class="row">
+            <span class="row-icon blue">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6l1.6 1.6H16a1.5 1.5 0 0 1 1.5 1.5v7.4A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"/></svg>
+            </span>
+            <div class="row-text"><div class="row-caption">Từ folder</div><div id="sum-folder" class="row-value"></div></div>
+            <button id="btn-open-local" class="link-btn">Mở</button>
+          </div>
+          <div class="row">
+            <span class="row-icon green">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M14.6 8.1A5 5 0 0 0 5 7.5a3.8 3.8 0 0 0 .7 7.5h8.6a3.5 3.5 0 0 0 .3-6.9Z"/></svg>
+            </span>
+            <div class="row-text"><div class="row-caption">Lên Drive</div><div id="sum-drive" class="row-value"></div></div>
+            <button id="btn-open-drive-side" class="link-btn">Mở</button>
+          </div>
         </div>
-        <div id="log-container" class="log-container">
-          <div class="log-empty">Chờ hoạt động...</div>
+        <div id="sum-options" class="tags"></div>
+        <p id="run-tip" class="note pad">Cứ export tiếp trong Lightroom — ảnh mới vào folder sẽ tự được upload. Có thể thu nhỏ app, tiến độ hiện trên thanh menu.</p>
+      </div>
+
+      <div class="side-footer">
+        <div id="idle-actions">
+          <button id="btn-start" class="btn btn-blue btn-large" disabled>Bắt đầu upload</button>
+          <p id="start-hint" class="note center-text"></p>
+        </div>
+        <div id="running-actions" class="hidden">
+          <div class="btn-row">
+            <button id="btn-pause" class="btn">Tạm dừng</button>
+            <button id="btn-check" class="btn" title="Thử lại ngay file lỗi và đối chiếu với Drive">Kiểm tra</button>
+          </div>
+          <button id="btn-stop" class="btn btn-large btn-quiet-red">Dừng</button>
+        </div>
+        <div id="after-actions" class="hidden">
+          <button id="btn-new-session" class="btn btn-blue btn-large">Buổi chụp mới</button>
+          <button id="btn-resume-session" class="btn btn-large">Chạy lại buổi này</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ═══ Nội dung chính ═══ -->
+    <main class="content">
+      <!-- Chưa có folder: vùng kéo thả lớn -->
+      <section id="drop-hero" class="drop-hero" tabindex="0" role="button" aria-label="Chọn folder ảnh">
+        <div class="drop-inner">
+          <div class="drop-icon">
+            <svg viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"
+                d="M46 46h3.5a10.5 10.5 0 0 0 1.4-20.9A15 15 0 0 0 22 21.5 12 12 0 0 0 16 46h2" />
+              <path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M32 52V31m-8 8 8-8 8 8" />
+            </svg>
+          </div>
+          <h1>Kéo thả folder ảnh vào đây</h1>
+          <p>Ảnh Lightroom export vào folder sẽ tự upload lên Google Drive</p>
+          <button id="btn-choose-folder" class="btn btn-blue">Chọn folder…</button>
+          <span class="kbd-hint">hoặc nhấn ⌘O</span>
         </div>
       </section>
+
+      <!-- Đã có folder -->
+      <section id="workspace" class="workspace hidden">
+        <div class="ws-header">
+          <div class="ws-folder">
+            <div class="ws-folder-icon">
+              <svg viewBox="0 0 20 20" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6l1.6 1.6H16a1.5 1.5 0 0 1 1.5 1.5v7.4A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"/></svg>
+            </div>
+            <div class="ws-folder-text">
+              <div id="folder-name" class="ws-title"></div>
+              <div id="folder-meta" class="ws-sub"></div>
+            </div>
+            <button id="btn-change-folder" class="btn btn-small">Đổi folder</button>
+          </div>
+        </div>
+
+        <div class="progress-card" id="hero" data-phase="idle">
+          <div class="pc-top">
+            <div>
+              <div id="hero-label" class="pc-label">Sẵn sàng</div>
+              <div class="pc-count"><span id="hero-done">0</span><span class="pc-total"> / <span id="hero-target">0</span> ảnh</span></div>
+            </div>
+            <div class="pc-right">
+              <div id="hero-pct" class="pc-pct">0%</div>
+              <div id="hero-eta" class="pc-eta"></div>
+            </div>
+          </div>
+          <div class="bar"><div id="progress-fill" class="bar-fill"></div></div>
+          <div class="pc-bottom">
+            <div id="hero-sub" class="pc-sub"></div>
+            <div id="chips" class="chips"></div>
+          </div>
+          <div id="done-actions" class="pc-actions hidden">
+            <button id="btn-copy-link" class="btn btn-blue">Copy link cho khách</button>
+            <button id="btn-open-drive" class="btn">Mở trên Drive</button>
+            <span class="note">Link xem công khai — khách mở không cần đăng nhập</span>
+          </div>
+        </div>
+
+        <div class="view-bar">
+          <div class="segmented" role="tablist">
+            <button class="seg active" data-tab="files" role="tab">Ảnh <span id="files-count" class="count"></span></button>
+            <button class="seg" data-tab="log" role="tab">Nhật ký</button>
+            <button class="seg" data-tab="history" role="tab">Lịch sử</button>
+          </div>
+          <span class="spacer"></span>
+          <div id="file-filter" class="segmented small">
+            <button class="seg active" data-filter="all">Tất cả</button>
+            <button class="seg" data-filter="pending">Chưa xong</button>
+            <button class="seg" data-filter="error">Lỗi</button>
+          </div>
+          <div id="view-toggle" class="segmented small icon-seg" role="radiogroup" aria-label="Kiểu hiển thị">
+            <button class="seg" data-view="grid" title="Dạng lưới" aria-label="Dạng lưới">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z"/></svg>
+            </button>
+            <button class="seg active" data-view="list" title="Dạng danh sách" aria-label="Dạng danh sách">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M2 3h2v2H2zM6 3.25h8v1.5H6zM2 7h2v2H2zM6 7.25h8v1.5H6zM2 11h2v2H2zM6 11.25h8v1.5H6z"/></svg>
+            </button>
+          </div>
+          <button id="btn-clear-logs" class="link-btn hidden">Xoá nhật ký</button>
+        </div>
+
+        <div id="tab-files" class="tab-body">
+          <div id="list-head" class="list-head hidden">
+            <span></span><span>Tên</span><span>Trạng thái</span><span class="right">Dung lượng</span>
+          </div>
+          <div id="file-grid" class="grid list"></div>
+          <div id="files-empty" class="empty hidden"></div>
+        </div>
+        <div id="tab-log" class="tab-body hidden">
+          <div id="log-container" class="log"><div class="empty">Chưa có hoạt động</div></div>
+        </div>
+        <div id="tab-history" class="tab-body hidden">
+          <div id="history-list" class="history"></div>
+        </div>
+      </section>
+
+      <div id="drag-overlay" class="drag-overlay hidden"><div>Thả để chọn folder này</div></div>
+    </main>
+  </div>
+
+  <!-- ═══ Xem trước ảnh ═══ -->
+  <div id="viewer" class="viewer hidden" role="dialog" aria-modal="true" aria-label="Xem ảnh">
+    <div class="viewer-top">
+      <div class="viewer-title"><span id="viewer-name"></span><span id="viewer-meta" class="viewer-meta"></span></div>
+      <div class="viewer-tools">
+        <button id="viewer-finder" class="vbtn">Hiện trong Finder</button>
+        <button id="viewer-close" class="vbtn" aria-label="Đóng">✕</button>
+      </div>
+    </div>
+    <button id="viewer-prev" class="viewer-nav prev" aria-label="Ảnh trước">‹</button>
+    <img id="viewer-img" class="viewer-img" alt="">
+    <button id="viewer-next" class="viewer-nav next" aria-label="Ảnh sau">›</button>
+    <div id="viewer-pos" class="viewer-pos"></div>
+  </div>
+
+  <!-- ═══ Kết nối Google Drive ═══ -->
+  <div id="setup-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+    <div class="sheet">
+      <h2 id="setup-title">Google Drive</h2>
+      <p class="note">Snappy Drive dùng rclone để upload lên Google Drive.</p>
+      <div class="group">
+        <div class="row check-item" id="check-installed">
+          <div class="check-icon"><span class="spinner"></span></div>
+          <div class="row-text"><div class="check-title">rclone</div><div class="check-detail">Đang kiểm tra...</div></div>
+          <button id="btn-install-help" class="link-btn hidden">Hướng dẫn</button>
+        </div>
+        <div class="row check-item" id="check-remote">
+          <div class="check-icon"><span class="check-pending">○</span></div>
+          <div class="row-text"><div class="check-title">Tài khoản Google</div><div class="check-detail">Chờ kiểm tra...</div></div>
+          <button id="btn-create-remote" class="btn btn-blue btn-small hidden">Kết nối</button>
+        </div>
+        <div class="row check-item" id="check-connection">
+          <div class="check-icon"><span class="check-pending">○</span></div>
+          <div class="row-text"><div class="check-title">Kết nối</div><div class="check-detail">Chờ kiểm tra...</div></div>
+          <button id="btn-reconnect" class="btn btn-blue btn-small hidden">Kết nối lại</button>
+        </div>
+      </div>
+      <div id="install-instructions" class="info hidden">
+        Cài rclone bằng Homebrew: <code>brew install rclone</code><br>
+        hoặc tải tại <a href="#" id="link-rclone">rclone.org/downloads</a>, rồi bấm “Kiểm tra lại”.
+      </div>
+      <div id="config-output-panel" class="hidden"><div id="config-output" class="console"></div></div>
+      <div class="sheet-actions">
+        <button id="btn-reconfigure" class="link-btn hidden">Đổi tài khoản Google…</button>
+        <span class="spacer"></span>
+        <button id="btn-recheck" class="btn">Kiểm tra lại</button>
+        <button id="btn-continue" class="btn btn-blue" disabled>Xong</button>
+      </div>
+      <button id="btn-close-setup" class="sheet-close" aria-label="Đóng">✕</button>
     </div>
   </div>
 
+  <div id="toast" class="toast hidden"></div>
+
   <script src="renderer.js"></script>
 </body>
+
 </html>

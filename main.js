@@ -1,7 +1,11 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Notification, clipboard, powerSaveBlocker, Tray, Menu, nativeImage, protocol, net } = require('electron');
+const { pathToFileURL } = require('url');
 const path = require('path');
 const fs = require('fs');
-const { exec, spawn } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const { Uploader, UploadLog, TEXT_LOG_DIR } = require('./uploader');
+const { resolveTarget, FULLWIDTH_SLASH } = require('./drive-target');
+const { folderShootDate } = require('./exif');
 
 // Fix PATH for macOS .app bundles (Homebrew paths not inherited)
 const EXTRA_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/homebrew/sbin', '/usr/local/sbin'];
@@ -10,743 +14,575 @@ const shellEnv = {
   PATH: [...EXTRA_PATHS, process.env.PATH].join(':'),
 };
 
-let mainWindow;
-let pollingInterval = null;
-let isMonitoring = false;
+const FOLDER_ID_RE = /^[A-Za-z0-9_-]{10,}$/;
+
+let mainWindow = null;
+let uploader = null;
 let currentConfig = null;
-let scanLock = false;
-let lastNewFileTime = Date.now();
-let sleepTimerInterval = null;
-let currentUploadProcess = null; // Track rclone child process
+let lastStats = null;
+let lastDone = null;
+let sleepTimer = null;
+let powerBlockId = null;
+let forceQuit = false;
+let tray = null;
+let currentHistoryId = null;
 
-const POLL_INTERVAL_MS = 20000;
-const MAX_RETRIES = 3;
-const IGNORED_FILES = ['.DS_Store', 'Thumbs.db', 'desktop.ini'];
+// ─── Settings & history (userData/settings.json) ─────────
+const SETTINGS_KEYS = ['viewMode', 'monthFolders', 'currentMonthId', 'driveRootId', 'driveRootName', 'byMonth', 'destMode', 'lastDriveLink', 'lastFolder', 'options', 'logOpen'];
+const MAX_HISTORY = 30;
+let settings = null;
 
-// Stats: cumulative = across all sessions, session = current session only
-let stats = { total: 0, cumulativeUploaded: 0, sessionUploaded: 0, remaining: 0 };
+function settingsPath() { return path.join(app.getPath('userData'), 'settings.json'); }
+
+function loadSettings() {
+  if (settings) return settings;
+  try { settings = JSON.parse(fs.readFileSync(settingsPath(), 'utf-8')); } catch { settings = {}; }
+  if (!Array.isArray(settings.history)) settings.history = [];
+  // Buổi nào còn "đang chạy" từ lần mở trước (app bị tắt ngang) → đánh dấu đã dừng
+  for (const h of settings.history) if (!h.endedAt) h.endedAt = h.startedAt;
+  return settings;
+}
+
+function saveSettings() {
+  try {
+    const tmp = settingsPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), 'utf-8');
+    fs.renameSync(tmp, settingsPath());
+  } catch { /* skip */ }
+}
+
+function updateHistory(patch, persist = false) {
+  if (!currentHistoryId) return;
+  const h = loadSettings().history.find((x) => x.id === currentHistoryId);
+  if (h) Object.assign(h, patch);
+  if (persist) { saveSettings(); send('history-update', settings.history); }
+}
+
+// ─── Tray (thanh menu macOS) ─────────────────────────────
+function showWindow() {
+  if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createWindow();
+}
+
+function updateTray(stats) {
+  if (!stats || stats.phase === 'stopped') {
+    if (tray) { tray.destroy(); tray = null; }
+    return;
+  }
+  if (!tray) {
+    tray = new Tray(nativeImage.createEmpty());
+    tray.setToolTip('Snappy Drive');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Mở Snappy Drive', click: showWindow },
+      { type: 'separator' },
+      { label: 'Thoát', click: () => app.quit() },
+    ]));
+  }
+  const n = `${stats.cumulativeUploaded}/${stats.target || stats.total}`;
+  const icon = { done: '✓', paused: '⏸', verifying: '🔎', stopping: '⏹' }[stats.phase];
+  tray.setTitle(icon ? `☁️ ${icon} ${n}` : `☁️ ${n}`);
+}
+
+// Cho phép chạy thử với thư mục dữ liệu riêng (không đụng cài đặt thật)
+if (process.env.SNAPPY_USER_DATA) app.setPath('userData', process.env.SNAPPY_USER_DATA);
+
+// ─── Thumbnail & xem trước ảnh: snappy://thumb?p=...&s=256, snappy://photo?p=... ──
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'snappy', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+]);
+
+const allowedFolders = new Set(); // chỉ phục vụ ảnh trong folder người dùng đã chọn
+const thumbCache = new Map();
+const MAX_THUMBS = 800;
+const BROWSER_IMAGE = /\.(jpe?g|png|gif|webp|avif)$/i;
+
+function isAllowedFile(p) {
+  if (typeof p !== 'string' || !path.isAbsolute(p)) return false;
+  return allowedFolders.has(path.dirname(path.resolve(p)));
+}
+
+async function makeThumb(p, size) {
+  const st = fs.statSync(p);
+  const key = `${p}|${st.mtimeMs}|${size}`;
+  if (thumbCache.has(key)) return thumbCache.get(key);
+  const img = await nativeImage.createThumbnailFromPath(p, { width: size, height: size });
+  const buf = img.toJPEG(82);
+  thumbCache.set(key, buf);
+  if (thumbCache.size > MAX_THUMBS) thumbCache.delete(thumbCache.keys().next().value);
+  return buf;
+}
+
+function registerImageProtocol() {
+  protocol.handle('snappy', async (req) => {
+    try {
+      const u = new URL(req.url);
+      const p = u.searchParams.get('p');
+      if (!isAllowedFile(p) || !fs.existsSync(p)) return new Response('not found', { status: 404 });
+      if (u.hostname === 'photo' && BROWSER_IMAGE.test(p)) return net.fetch(pathToFileURL(p).toString());
+      const size = u.hostname === 'photo' ? 2000 : Math.min(512, Math.max(64, parseInt(u.searchParams.get('s'), 10) || 256));
+      const buf = await makeThumb(p, size);
+      return new Response(buf, { headers: { 'content-type': 'image/jpeg', 'cache-control': 'max-age=86400' } });
+    } catch {
+      return new Response('error', { status: 404 });
+    }
+  });
+}
+
+// ─── Single instance ─────────────────────────────────────
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+  });
+}
 
 // ─── Window ──────────────────────────────────────────────
+const APP_ICON = path.join(__dirname, 'assets', 'icon.png');
+
 function createWindow() {
+  // Khi chạy bằng npm start, Dock hiện icon Electron mặc định → đổi sang logo Snappy
+  if (!app.isPackaged && app.dock) { try { app.dock.setIcon(APP_ICON); } catch { /* skip */ } }
   mainWindow = new BrowserWindow({
+    icon: APP_ICON,
     width: 1050,
-    height: 830,
+    height: 860,
     minWidth: 800,
     minHeight: 600,
     title: 'Snappy Drive',
     titleBarStyle: 'hiddenInset',
-    backgroundColor: '#0a0a1a',
+    backgroundColor: '#f6f6fa',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   });
   mainWindow.loadFile('index.html');
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
+  mainWindow.on('closed', () => { mainWindow = null; });
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => { registerImageProtocol(); createWindow(); });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
-// ─── Helpers ─────────────────────────────────────────────
-function getLogDir() {
-  if (currentConfig && currentConfig.folderPath) {
-    const dir = path.join(currentConfig.folderPath, 'upload-logs');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return dir;
+app.on('before-quit', (e) => {
+  if (!uploader || forceQuit) return;
+  if (uploader.isBusy()) {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Huỷ', 'Thoát'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Đang upload ảnh lên Drive',
+      detail: 'Thoát bây giờ sẽ dừng upload. Các file chưa xong sẽ được upload ở lần chạy sau.',
+    });
+    if (choice === 0) { e.preventDefault(); return; }
   }
-  const dir = path.join(app.getPath('userData'), 'logs');
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  forceQuit = true;
+  uploader.cancel();
+});
+
+// ─── Helpers ─────────────────────────────────────────────
+function send(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
+
+function pad(n) { return n.toString().padStart(2, '0'); }
+function formatFullTime(d) {
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function localDateStr(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+
+function getLogDir() {
+  const base = currentConfig?.folderPath && fs.existsSync(currentConfig.folderPath)
+    ? path.join(currentConfig.folderPath, TEXT_LOG_DIR)
+    : path.join(app.getPath('userData'), 'logs');
+  try { fs.mkdirSync(base, { recursive: true }); } catch { /* skip */ }
+  return base;
 }
 
 function logToFile(message) {
   const now = new Date();
-  const dateStr = now.toISOString().slice(0, 10);
-  const timeStr = now.toTimeString().slice(0, 5);
-  const line = `[${timeStr}] ${message}\n`;
-  const filePath = path.join(getLogDir(), `upload-log-${dateStr}.txt`);
-  fs.appendFileSync(filePath, line);
+  try {
+    fs.appendFileSync(path.join(getLogDir(), `upload-log-${localDateStr(now)}.txt`), `[${formatFullTime(now)}] ${message}\n`);
+  } catch { /* ổ bị rút */ }
 }
 
 function sendLog(message, type = 'info') {
   logToFile(message);
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('log', { message, type, time: new Date().toTimeString().slice(0, 5) });
-  }
+  send('log', { message, type, time: formatFullTime(new Date()) });
 }
 
-function sendStats() {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('stats-update', { ...stats });
-  }
-}
-
-function sendStatus(status) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('status-change', status);
-  }
-}
-
-function isIgnoredFile(filename) {
-  if (IGNORED_FILES.includes(filename)) return true;
-  if (filename.startsWith('.')) return true;
-  if (filename.startsWith('._')) return true;
-  return false;
+function rclone(args, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    execFile('rclone', args, { timeout, env: shellEnv, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; reject(err); } else resolve(stdout);
+    });
+  });
 }
 
 function extractFolderId(url) {
-  const patterns = [/\/folders\/([a-zA-Z0-9_-]+)/, /id=([a-zA-Z0-9_-]+)/];
+  if (typeof url !== 'string') return null;
+  const patterns = [/\/folders\/([a-zA-Z0-9_-]+)/, /[?&]id=([a-zA-Z0-9_-]+)/];
   for (const p of patterns) {
     const m = url.match(p);
-    if (m) return m[1];
+    if (m && FOLDER_ID_RE.test(m[1])) return m[1];
   }
   return null;
 }
 
-// ─── Session Logger ──────────────────────────────────────
-class SessionLogger {
-  constructor() {
-    this.logFilePath = null;
-    this.currentSession = null;
-    this.logData = { sessions: [], uploadedFiles: {} }; // uploadedFiles: { filename: { size, uploadedAt, status } }
+// ─── Power / sleep ───────────────────────────────────────
+function updatePowerBlock(phase) {
+  const needAwake = uploader && phase !== 'done' && phase !== 'stopped';
+  if (needAwake && powerBlockId === null) {
+    powerBlockId = powerSaveBlocker.start('prevent-app-suspension');
+  } else if (!needAwake && powerBlockId !== null) {
+    powerSaveBlocker.stop(powerBlockId);
+    powerBlockId = null;
   }
+}
 
-  init(folderPath) {
-    this.logFilePath = path.join(folderPath, 'appuploadanh-log.json');
-    try {
-      if (fs.existsSync(this.logFilePath)) {
-        const data = JSON.parse(fs.readFileSync(this.logFilePath, 'utf-8'));
-        this.logData = data;
-        if (!this.logData.uploadedFiles) this.logData.uploadedFiles = {};
+function cancelSleepTimer() {
+  if (sleepTimer) { clearTimeout(sleepTimer); sleepTimer = null; }
+}
 
-        // Rebuild uploadedFiles from old sessions if map is empty
-        if (Object.keys(this.logData.uploadedFiles).length === 0 && this.logData.sessions?.length > 0) {
-          for (const session of this.logData.sessions) {
-            if (!session.scans) continue;
-            for (const scan of session.scans) {
-              if (!scan.files) continue;
-              for (const file of scan.files) {
-                if (file.status === 'uploaded' || file.status === 'replaced') {
-                  this.logData.uploadedFiles[file.name] = {
-                    size: file.size || null,
-                    uploadedAt: file.uploadedAt || session.startTime,
-                  };
-                }
-              }
-            }
-          }
-          // Save rebuilt data
-          if (Object.keys(this.logData.uploadedFiles).length > 0) {
-            this.save();
-          }
-        }
-      }
-    } catch { this.logData = { sessions: [], uploadedFiles: {} }; }
-  }
+function scheduleSleep(minutes) {
+  cancelSleepTimer();
+  sendLog(`😴 Máy sẽ sleep sau ${minutes} phút nếu không có ảnh mới`, 'info');
+  sleepTimer = setTimeout(() => {
+    sleepTimer = null;
+    if (!uploader || uploader.phase() !== 'done') return;
+    sendLog('😴 Đã xong và không có ảnh mới — cho máy sleep', 'warn');
+    stopUploader();
+    setTimeout(() => execFile('pmset', ['sleepnow'], () => {}), 3000);
+  }, minutes * 60 * 1000);
+}
 
-  // Get count of previously uploaded files
-  getCumulativeUploadedCount() {
-    return Object.keys(this.logData.uploadedFiles || {}).length;
-  }
+// ─── Uploader wiring ─────────────────────────────────────
+function stopUploader() {
+  if (uploader) uploader.stop();
+}
 
-  // Get list of previously uploaded filenames
-  getUploadedFileNames() {
-    return new Set(Object.keys(this.logData.uploadedFiles || {}));
-  }
+function onDone(summary) {
+  lastDone = summary;
+  updateHistory({ onDrive: summary.onDrive, total: summary.total, uploaded: summary.sessionUploaded, completedAt: new Date().toISOString() }, true);
+  send('upload-done', summary);
 
-  startSession(config) {
-    this.currentSession = {
-      id: `session_${Date.now()}`,
-      startTime: new Date().toISOString(),
-      endTime: null,
-      folderPath: config.folderPath,
-      driveFolderId: config.folderId,
-      overwrite: config.overwrite || false,
-      scans: [],
-      filesUploaded: 0,
-      filesFailed: 0,
-      totalBytesUploaded: 0,
-      errors: [],
-    };
-    return this.currentSession;
-  }
 
-  logScan(scanData) {
-    if (!this.currentSession) return;
-    this.currentSession.scans.push({
-      timestamp: new Date().toISOString(),
-      localFileCount: scanData.localFileCount,
-      remoteFileCount: scanData.remoteFileCount || null,
-      filesStillWriting: scanData.filesStillWriting || false,
-      uploadResult: null,
-      files: [],
+  if (Notification.isSupported()) {
+    const extra = summary.conflicts ? ` · ${summary.conflicts} file trùng tên` : '';
+    const n = new Notification({
+      title: '✅ Snappy Drive — đã upload xong',
+      body: `${summary.onDrive}/${summary.total} ảnh đã có trên Drive${extra}`,
     });
+    n.on('click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createWindow(); });
+    n.show();
   }
+  if (app.dock) app.dock.bounce('informational');
 
-  logFileUploaded(fileName, fileSize) {
-    if (!this.currentSession) return;
-    const scanIndex = this.currentSession.scans.length - 1;
-    if (scanIndex >= 0) {
-      this.currentSession.scans[scanIndex].files.push({
-        name: fileName,
-        size: fileSize,
-        uploadedAt: new Date().toISOString(),
-        status: 'uploaded',
-      });
-    }
-    this.currentSession.filesUploaded++;
-    if (fileSize) this.currentSession.totalBytesUploaded += fileSize;
-
-    // Add to cumulative uploaded files
-    this.logData.uploadedFiles[fileName] = {
-      size: fileSize,
-      uploadedAt: new Date().toISOString(),
-    };
-  }
-
-  // Sync: mark all local files as uploaded (when Drive confirms they're all there)
-  syncAllLocalFiles(folderPath) {
-    try {
-      const files = fs.readdirSync(folderPath);
-      let added = 0;
-      for (const f of files) {
-        if (f.startsWith('.') || ['Thumbs.db', 'desktop.ini'].includes(f)) continue;
-        try {
-          const stat = fs.statSync(path.join(folderPath, f));
-          if (!stat.isFile()) continue;
-          if (!this.logData.uploadedFiles[f]) {
-            this.logData.uploadedFiles[f] = {
-              size: stat.size,
-              uploadedAt: new Date().toISOString(),
-            };
-            added++;
-          }
-        } catch { /* skip */ }
-      }
-      if (added > 0) this.save();
-      return added;
-    } catch { return 0; }
-  }
-
-  logFileFailed(fileName, error) {
-    if (!this.currentSession) return;
-    const scanIndex = this.currentSession.scans.length - 1;
-    if (scanIndex >= 0) {
-      this.currentSession.scans[scanIndex].files.push({
-        name: fileName,
-        status: 'failed',
-        error,
-      });
-    }
-    this.currentSession.filesFailed++;
-    this.currentSession.errors.push({ timestamp: new Date().toISOString(), file: fileName, message: error });
-  }
-
-  logScanResult(result) {
-    if (!this.currentSession) return;
-    const scanIndex = this.currentSession.scans.length - 1;
-    if (scanIndex >= 0) {
-      this.currentSession.scans[scanIndex].uploadResult = {
-        success: result.success,
-        transferred: result.transferred,
-        durationMs: result.durationMs,
-      };
-      if (result.remoteFileCount !== undefined) {
-        this.currentSession.scans[scanIndex].remoteFileCount = result.remoteFileCount;
-      }
-    }
-  }
-
-  endSession() {
-    if (!this.currentSession) return;
-    this.currentSession.endTime = new Date().toISOString();
-    this.logData.sessions.push(this.currentSession);
-    this.save();
-    this.currentSession = null;
-  }
-
-  saveProgress() {
-    if (!this.logFilePath) return;
-    try {
-      const snapshot = { ...this.logData };
-      if (this.currentSession) {
-        snapshot.sessions = [...this.logData.sessions, { ...this.currentSession, endTime: null }];
-      }
-      fs.writeFileSync(this.logFilePath, JSON.stringify(snapshot, null, 2), 'utf-8');
-    } catch { /* skip */ }
-  }
-
-  save() {
-    if (!this.logFilePath) return;
-    try {
-      fs.writeFileSync(this.logFilePath, JSON.stringify(this.logData, null, 2), 'utf-8');
-    } catch { /* skip */ }
-  }
+  if (currentConfig?.autoSleep && currentConfig.sleepMinutes > 0) scheduleSleep(currentConfig.sleepMinutes);
 }
 
-const sessionLogger = new SessionLogger();
-
-// ─── File helpers ────────────────────────────────────────
-function getWritingFiles(folderPath, thresholdMs = 5000) {
-  const writingFiles = [];
-  try {
-    const files = fs.readdirSync(folderPath);
-    const now = Date.now();
-    for (const f of files) {
-      if (isIgnoredFile(f)) continue;
-      try {
-        const stat = fs.statSync(path.join(folderPath, f));
-        if (stat.isFile() && (now - stat.mtimeMs) < thresholdMs) {
-          writingFiles.push(f);
-        }
-      } catch { /* skip */ }
-    }
-  } catch { /* skip */ }
-  return writingFiles;
-}
-
-function getUnuploadedLocalFilesCount(folderPath, uploadedFilesMap) {
-  let count = 0;
-  let total = 0;
-  try {
-    const files = fs.readdirSync(folderPath);
-    for (const f of files) {
-      if (isIgnoredFile(f)) continue;
-      try {
-        if (fs.statSync(path.join(folderPath, f)).isFile()) {
-           total++;
-           if (!uploadedFilesMap[f]) count++;
-        }
-      } catch { }
-    }
-  } catch {}
-  return { total, unuploaded: count };
-}
-
-function countLocalFiles(folderPath) {
-  return getUnuploadedLocalFilesCount(folderPath, {}).total;
-}
-
-function getRemoteFileCount(folderId) {
-  return new Promise((resolve) => {
-    exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --files-only --exclude ".*"`, { timeout: 60000, env: shellEnv }, (error, stdout) => {
-      if (error) { resolve(0); return; }
-      resolve(stdout.split('\n').filter(Boolean).length);
-    });
-  });
-}
-
-// ─── Upload with real-time progress ──────────────────────
-function runRcloneUpload(folderPath, folderId, overwrite = false, excludeFiles = []) {
-  return new Promise((resolve) => {
-    const args = [
-      'copy', folderPath, 'drive:',
-      '--drive-root-folder-id', folderId,
-      '--exclude', '.*',
-      '--exclude', 'Thumbs.db',
-      '--exclude', 'desktop.ini',
-      '-v', '--stats', '3s',
-      '--tpslimit', '10',
-      '--transfers', '4',
-      '--drive-chunk-size', '64M'
-    ];
-    if (!overwrite) args.push('--ignore-existing');
-    for (const ef of excludeFiles) {
-      args.push('--exclude', ef);
-    }
-
-    const child = spawn('rclone', args, { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
-    currentUploadProcess = child;
-
-    let lastProgressLine = '';
-    let currentTransferringFile = null;
-    let transferredCount = 0;
-    let hasError = false;
-    const uploadStartTime = Date.now();
-
-    child.stderr.on('data', (data) => {
-      const lines = data.toString().split('\n').filter(Boolean);
-
-      for (const line of lines) {
-        if (line.includes(': Copied (new)') || line.includes(': Copied (replaced')) {
-          const match = line.match(/:\s+(.+?):\s+Copied/);
-          const isReplaced = line.includes('replaced');
-          if (match) {
-            transferredCount++;
-            const fileName = match[1];
-            sendLog(`✅ ${fileName} — đã upload${isReplaced ? ' (đè)' : ''}`, 'success');
-
-            // Get file size
-            let fileSize = null;
-            try { fileSize = fs.statSync(path.join(folderPath, fileName)).size; } catch {}
-
-            // Update stats
-            stats.sessionUploaded++;
-            stats.cumulativeUploaded++;
-            stats.remaining = Math.max(0, stats.total - stats.cumulativeUploaded);
-            sendStats();
-            lastNewFileTime = Date.now();
-
-            // Structured log
-            sessionLogger.logFileUploaded(fileName, fileSize);
-          }
-        } else if (line.includes('Transferred:') && line.includes('/')) {
-          const statsMatch = line.match(/Transferred:\s+(\d+)\s*\/\s*(\d+)/);
-          if (statsMatch) {
-            const done = parseInt(statsMatch[1]);
-            const total = parseInt(statsMatch[2]);
-            const speedMatch = line.match(/,\s*([\d.]+\s*\w+\/s)/);
-            const etaMatch = line.match(/ETA\s+([\dhms]+)/);
-            let progressMsg = `📤 ${done}/${total} file`;
-            if (speedMatch) progressMsg += ` | ${speedMatch[1]}`;
-            if (etaMatch) progressMsg += ` | ETA ${etaMatch[1]}`;
-            if (currentTransferringFile) {
-              progressMsg += ` | ⏳ ${currentTransferringFile}`;
-            }
-            if (progressMsg !== lastProgressLine) {
-              lastProgressLine = progressMsg;
-              sendLog(progressMsg, 'info');
-              currentTransferringFile = null; // Clear to wait for next file update
-            }
-          }
-        } else if (line.trim().startsWith('* ') && line.includes(':')) {
-          const fileMatch = line.match(/\*\s+([^:]+):/);
-          if (fileMatch) currentTransferringFile = fileMatch[1].trim();
-        } else if (line.includes('ERROR')) {
-          hasError = true;
-          const errMatch = line.match(/:\s+(.+?):\s+(.+)/);
-          if (errMatch) {
-            sendLog(`❌ ${errMatch[1]}: ${errMatch[2]}`, 'error');
-            sessionLogger.logFileFailed(errMatch[1], errMatch[2]);
-          }
-        } else if (line.includes('There was nothing to transfer')) {
-          sendLog('✓ Tất cả file đã được upload trước đó', 'info');
-        }
-      }
-    });
-
-    child.on('close', (code) => {
-      currentUploadProcess = null;
-      resolve({ success: code === 0, transferred: transferredCount, hasError, durationMs: Date.now() - uploadStartTime });
-    });
-
-    child.on('error', (err) => {
-      currentUploadProcess = null;
-      resolve({ success: false, transferred: 0, hasError: true, durationMs: Date.now() - uploadStartTime });
-    });
-  });
-}
-
-// ─── Scan & Upload ───────────────────────────────────────
-async function scanAndUpload(config, retryCount = 0) {
-  if (scanLock) {
-    sendLog('⏳ Upload đang chạy, chờ hoàn thành...', 'warn');
-    return;
+function onStats(stats) {
+  const prevPhase = lastStats?.phase;
+  lastStats = stats;
+  send('stats-update', stats);
+  updatePowerBlock(stats.phase);
+  updateTray(stats);
+  updateHistory({ uploaded: stats.sessionUploaded, total: stats.total, onDrive: stats.cumulativeUploaded });
+  if (stats.phase !== 'done') {
+    if (sleepTimer) { cancelSleepTimer(); sendLog('⏰ Có ảnh mới — huỷ hẹn giờ sleep', 'info'); }
+    if (prevPhase === 'done') { lastDone = null; send('upload-done', null); }
   }
+  if (app.dock) app.dock.setBadge(stats.remaining > 0 ? String(stats.remaining) : '');
+}
 
-  scanLock = true;
-  const { folderPath, folderId } = config;
+function onStopped() {
+  sendLog('⏹ Đã dừng theo dõi', 'info');
+  updateHistory({ endedAt: new Date().toISOString() }, true);
+  currentHistoryId = null;
+  updateTray(null);
+  cancelSleepTimer();
+  uploader = null;
+  updatePowerBlock('stopped');
+  if (app.dock) app.dock.setBadge('');
+  send('status-change', 'stopped');
+}
 
-  try {
-    if (!fs.existsSync(folderPath)) {
-      sendLog('Folder theo dõi không tồn tại!', 'error');
-      return;
-    }
+// ─── IPC: Settings ───────────────────────────────────────
+ipcMain.handle('get-settings', () => loadSettings());
 
-    const { total: localCount, unuploaded: unuploadedCount } = getUnuploadedLocalFilesCount(folderPath, sessionLogger.logData.uploadedFiles || {});
-    stats.total = localCount;
-    stats.remaining = unuploadedCount;
-    sendLog(`📁 Quét folder: ${localCount} file (đã upload: ${stats.cumulativeUploaded}, cần up mới: ${stats.remaining})`);
-    sendStats();
-
-    // Log scan
-    const writingFiles = getWritingFiles(folderPath, 5000);
-    const isStillWriting = writingFiles.length > 0;
-    sessionLogger.logScan({ localFileCount: localCount, filesStillWriting: isStillWriting });
-
-    if (isStillWriting) {
-      const stableCount = localCount - writingFiles.length;
-      sendLog(`⏳ ${writingFiles.length} file đang ghi, bỏ qua — upload ${stableCount} file đã ổn định`, 'info');
-    }
-
-    if (stats.remaining <= 0 && !config.overwrite) {
-      sendLog('✓ Tất cả file đã upload — chờ file mới...', 'info');
-      sessionLogger.saveProgress();
-      return;
-    }
-
-    // If ALL remaining files are still writing, skip this scan
-    if (isStillWriting && (unuploadedCount - writingFiles.length) <= 0 && !config.overwrite) {
-      sendLog('⏳ Các file chưa upload đều đang ghi, chờ lần quét tiếp...', 'warn');
-      sessionLogger.saveProgress();
-      return;
-    }
-
-    sendLog('🚀 Bắt đầu upload...', 'info');
-    const result = await runRcloneUpload(folderPath, folderId, config.overwrite, writingFiles);
-
-    // Log result
-    const remoteCount = await getRemoteFileCount(folderId);
-    sessionLogger.logScanResult({ ...result, remoteFileCount: remoteCount });
-
-    if (result.success) {
-      // Update cumulative from remote
-      stats.cumulativeUploaded = remoteCount;
-      stats.remaining = Math.max(0, localCount - remoteCount);
-      sendStats();
-
-      // Sync uploadedFiles map with actual state
-      if (remoteCount >= localCount) {
-        const added = sessionLogger.syncAllLocalFiles(folderPath);
-        if (added > 0) sendLog(`📝 Log đã cập nhật: +${added} file từ phiên trước`, 'info');
-      }
-
-      if (result.transferred > 0) {
-        sendLog(`🎉 Hoàn thành! Upload ${result.transferred} file (tổng: ${stats.cumulativeUploaded}/${stats.total})`, 'success');
-      } else {
-        sendLog(`✓ Đồng bộ OK — ${stats.cumulativeUploaded}/${stats.total} file trên Drive`, 'info');
-      }
-    } else if (retryCount < MAX_RETRIES) {
-      sendLog(`⚠️ Upload lỗi, thử lại lần ${retryCount + 1}/${MAX_RETRIES}...`, 'warn');
-      scanLock = false;
-      return scanAndUpload(config, retryCount + 1);
-    } else {
-      sendLog(`❌ Upload thất bại sau ${MAX_RETRIES} lần thử`, 'error');
-    }
-
-    sessionLogger.saveProgress();
-  } catch (err) {
-    sendLog(`❌ Lỗi: ${err.message}`, 'error');
-  } finally {
-    scanLock = false;
+ipcMain.handle('save-settings', (_, patch) => {
+  loadSettings();
+  if (patch && typeof patch === 'object') {
+    for (const k of SETTINGS_KEYS) if (k in patch) settings[k] = patch[k];
   }
-}
-
-// ─── Auto-sleep ──────────────────────────────────────────
-function startSleepTimer(idleMinutes) {
-  if (sleepTimerInterval) clearInterval(sleepTimerInterval);
-  sleepTimerInterval = setInterval(() => {
-    const idleMs = Date.now() - lastNewFileTime;
-    if (idleMs >= idleMinutes * 60 * 1000 && isMonitoring) {
-      sendLog(`😴 Không có file mới trong ${idleMinutes} phút. Sleep máy...`, 'warn');
-      stopMonitoring();
-      setTimeout(() => { exec('pmset sleepnow', { env: shellEnv }); }, 3000);
-    }
-  }, 30000);
-}
-
-function stopSleepTimer() {
-  if (sleepTimerInterval) { clearInterval(sleepTimerInterval); sleepTimerInterval = null; }
-}
-
-// ─── Stop monitoring ──────────────────────────────────────
-function stopMonitoring() {
-  if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
-  isMonitoring = false;
-  currentConfig = null;
-  stopSleepTimer();
-  sessionLogger.endSession();
-  sendStatus('stopped');
-}
-
-// ─── IPC: Read log from folder ───────────────────────────
-ipcMain.handle('read-folder-log', (_, folderPath) => {
-  const logPath = path.join(folderPath, 'appuploadanh-log.json');
-  try {
-    if (fs.existsSync(logPath)) {
-      const data = JSON.parse(fs.readFileSync(logPath, 'utf-8'));
-      let uploadedFiles = data.uploadedFiles || {};
-
-      // Rebuild from sessions if uploadedFiles is empty (old log format)
-      if (Object.keys(uploadedFiles).length === 0 && data.sessions?.length > 0) {
-        for (const session of data.sessions) {
-          if (!session.scans) continue;
-          for (const scan of session.scans) {
-            if (!scan.files) continue;
-            for (const file of scan.files) {
-              if (file.status === 'uploaded' || file.status === 'replaced') {
-                uploadedFiles[file.name] = { size: file.size || null, uploadedAt: file.uploadedAt };
-              }
-            }
-          }
-        }
-      }
-
-      const cumulativeUploaded = Object.keys(uploadedFiles).length;
-      const { total: localCount, unuploaded: unuploadedCount } = getUnuploadedLocalFilesCount(folderPath, uploadedFiles);
-      const totalSessions = (data.sessions || []).length;
-      return {
-        hasLog: true,
-        cumulativeUploaded,
-        localCount,
-        remaining: unuploadedCount,
-        totalSessions,
-      };
-    }
-  } catch { /* skip */ }
-  const localCount = countLocalFiles(folderPath);
-  return { hasLog: false, cumulativeUploaded: 0, localCount, remaining: localCount, totalSessions: 0 };
+  saveSettings();
+  return settings;
 });
 
-// ─── IPC: Setup checks ──────────────────────────────────
-ipcMain.handle('check-rclone-full', async () => {
-  const result = { installed: false, version: null, remoteExists: false, connectionOk: false, errorDetail: '' };
-  try {
-    const version = await new Promise((resolve, reject) => {
-      exec('rclone version', { env: shellEnv }, (err, stdout) => {
-        if (err) reject(err);
-        else { const m = stdout.match(/rclone v([^\s]+)/); resolve(m ? m[1] : 'unknown'); }
-      });
-    });
-    result.installed = true; result.version = version;
-  } catch { result.errorDetail = 'rclone chưa được cài đặt'; return result; }
-
-  try {
-    const remotes = await new Promise((resolve, reject) => {
-      exec('rclone listremotes', { env: shellEnv }, (err, stdout) => { if (err) reject(err); else resolve(stdout); });
-    });
-    const list = remotes.split('\n').map(r => r.trim()).filter(Boolean);
-    result.remoteExists = list.includes('drive:');
-    if (!result.remoteExists) {
-      result.errorDetail = `Remote "drive" chưa tồn tại. Hiện có: ${list.length > 0 ? list.join(', ') : '(trống)'}`;
-      return result;
-    }
-  } catch (err) { result.errorDetail = `Lỗi: ${err.message}`; return result; }
-
-  try {
-    await new Promise((resolve, reject) => {
-      exec('rclone about drive:', { timeout: 30000, env: shellEnv }, (err, stdout) => { if (err) reject(err); else resolve(stdout); });
-    });
-    result.connectionOk = true;
-  } catch { result.errorDetail = 'Kết nối Google Drive thất bại. Token có thể đã hết hạn.'; }
-  return result;
+ipcMain.handle('remove-history', (_, id) => {
+  loadSettings();
+  settings.history = id ? settings.history.filter((h) => h.id !== id || h.id === currentHistoryId) : settings.history.filter((h) => h.id === currentHistoryId);
+  saveSettings();
+  return settings.history;
 });
 
-ipcMain.handle('create-drive-remote', async () => {
-  return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.on('close', (code) => resolve(code === 0 ? { success: true, message: 'Remote "drive" đã tạo thành công!' } : { success: false, message: `Lỗi: ${err || out}` }));
-    child.on('error', (e) => resolve({ success: false, message: e.message }));
-  });
-});
-
-ipcMain.handle('reconfigure-drive-remote', async () => {
-  await new Promise((r) => exec('rclone config delete drive', { env: shellEnv }, () => r()));
-  return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'create', 'drive', 'drive'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.on('close', (code) => resolve(code === 0 ? { success: true, message: 'Đã cấu hình lại thành công!' } : { success: false, message: `Lỗi: ${err || out}` }));
-    child.on('error', (e) => resolve({ success: false, message: e.message }));
-  });
-});
-
-ipcMain.handle('reconnect-drive-remote', async () => {
-  return new Promise((resolve) => {
-    const child = spawn('rclone', ['config', 'reconnect', 'drive:'], { stdio: ['pipe', 'pipe', 'pipe'], env: shellEnv });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.stderr.on('data', (d) => { err += d; mainWindow?.webContents.send('config-output', d.toString()); });
-    child.on('close', (code) => resolve(code === 0 ? { success: true, message: 'Đã kết nối lại thành công!' } : { success: false, message: `Lỗi: ${err || out}` }));
-    child.on('error', (e) => resolve({ success: false, message: e.message }));
-  });
-});
-
-ipcMain.handle('open-url', (_, url) => shell.openExternal(url));
-
-ipcMain.handle('check-folder-access', async (_, folderId) => {
+// ─── IPC: Folder ─────────────────────────────────────────
+ipcMain.handle('validate-folder', (_, folderPath) => {
   try {
-    await new Promise((resolve, reject) => {
-      exec(`rclone lsf "drive:" --drive-root-folder-id="${folderId}" --max-depth 1`, { timeout: 15000, env: shellEnv }, (err, stdout) => {
-        if (err) reject(err); else resolve(stdout);
-      });
+    const ok = typeof folderPath === 'string' && fs.statSync(folderPath).isDirectory();
+    if (ok) allowedFolders.add(path.resolve(folderPath));
+    return ok;
+  } catch { return false; }
+});
+
+ipcMain.handle('list-folder', (_, folderPath, startFromName = '') => {
+  if (typeof folderPath !== 'string' || !allowedFolders.has(path.resolve(folderPath))) return [];
+  return UploadLog.listWithStatus(folderPath, startFromName);
+});
+
+ipcMain.handle('show-in-finder', (_, filePath) => { if (isAllowedFile(filePath)) shell.showItemInFolder(filePath); });
+
+// Bật chia sẻ "Ai có link đều xem được" cho thư mục khách rồi trả về link
+async function makePublicLink({ folderId, parentId, name }) {
+  const args = parentId && name
+    ? ['link', `drive:${name.replace(/\//g, FULLWIDTH_SLASH)}`, '--drive-root-folder-id', parentId]
+    : ['link', 'drive:', '--drive-root-folder-id', folderId];
+  const out = await rclone(args, 60000);
+  const url = out.trim().split('\n').pop().trim();
+  if (!/^https:\/\//.test(url)) throw new Error('rclone không trả về link');
+  return url;
+}
+
+ipcMain.handle('public-link', async (_, historyId) => {
+  const h = loadSettings().history.find((x) => x.id === historyId);
+  if (!h) return { success: false, message: 'Không tìm thấy buổi upload' };
+  if (h.publicLink) return { success: true, url: h.publicLink, cached: true };
+  if (!FOLDER_ID_RE.test(h.driveFolderId || '')) return { success: false, message: 'Thiếu ID thư mục Drive' };
+  if (!h.linkParentId) {
+    // Upload thẳng vào thư mục có sẵn (có thể là cả thư mục tháng) → hỏi trước khi mở công khai
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Huỷ', 'Chia sẻ công khai'],
+      defaultId: 0,
+      cancelId: 0,
+      message: `Chia sẻ công khai “${h.driveName || 'thư mục này'}”?`,
+      detail: 'Ai có link đều xem được toàn bộ ảnh trong thư mục này, kể cả ảnh của khách khác nếu có.',
     });
-    return { hasAccess: true };
-  } catch {
-    return { hasAccess: false, error: 'Không có quyền truy cập folder này hoặc folder không tồn tại.' };
+    if (choice !== 1) return { success: false, cancelled: true };
   }
+  try {
+    const url = await makePublicLink({ folderId: h.driveFolderId, parentId: h.linkParentId, name: h.linkName });
+    h.publicLink = url;
+    saveSettings();
+    send('history-update', settings.history);
+    return { success: true, url };
+  } catch (e) {
+    const why = (e.stderr || e.message || '').trim().split('\n').pop().replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d \w+\s*:\s*/, '');
+    return { success: false, message: `Không bật được chia sẻ công khai: ${why}` };
+  }
+});
+
+ipcMain.handle('read-folder-log', (_, folderPath, startFromName = '') => {
+  if (typeof folderPath !== 'string' || !fs.existsSync(folderPath)) {
+    return { hasLog: false, cumulativeUploaded: 0, localCount: 0, remaining: 0, totalSessions: 0 };
+  }
+  return UploadLog.summarize(folderPath, startFromName);
 });
 
 ipcMain.handle('select-folder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'], title: 'Chọn folder theo dõi' });
+  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'], title: 'Chọn folder Lightroom export ra' });
   if (result.canceled) return null;
   return result.filePaths[0];
 });
 
 ipcMain.handle('validate-drive-link', (_, url) => extractFolderId(url));
 
+// ─── IPC: Setup checks ──────────────────────────────────
+ipcMain.handle('check-rclone-full', async () => {
+  const result = { installed: false, version: null, remoteExists: false, connectionOk: false, errorDetail: '' };
+  try {
+    const out = await rclone(['version'], 10000);
+    const m = out.match(/rclone v([^\s]+)/);
+    result.installed = true;
+    result.version = m ? m[1] : 'unknown';
+  } catch { result.errorDetail = 'rclone chưa được cài đặt'; return result; }
+
+  try {
+    const list = (await rclone(['listremotes'], 10000)).split('\n').map((r) => r.trim()).filter(Boolean);
+    result.remoteExists = list.includes('drive:');
+    if (!result.remoteExists) {
+      result.errorDetail = `Remote "drive" chưa tồn tại. Hiện có: ${list.length ? list.join(', ') : '(trống)'}`;
+      return result;
+    }
+  } catch (err) { result.errorDetail = `Lỗi: ${err.message}`; return result; }
+
+  try {
+    await rclone(['about', 'drive:'], 30000);
+    result.connectionOk = true;
+  } catch { result.errorDetail = 'Kết nối Google Drive thất bại. Token có thể đã hết hạn.'; }
+  return result;
+});
+
+function runRcloneInteractive(args, okMessage) {
+  return new Promise((resolve) => {
+    const child = spawn('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'], env: shellEnv });
+    let out = '';
+    const onData = (d) => { out += d; send('config-output', d.toString()); };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('close', (code) => resolve(code === 0 ? { success: true, message: okMessage } : { success: false, message: `Lỗi: ${out.trim().split('\n').pop() || code}` }));
+    child.on('error', (e) => resolve({ success: false, message: e.message }));
+  });
+}
+
+ipcMain.handle('create-drive-remote', () => runRcloneInteractive(['config', 'create', 'drive', 'drive'], 'Remote "drive" đã tạo thành công!'));
+
+ipcMain.handle('reconfigure-drive-remote', async () => {
+  if (uploader) return { success: false, message: 'Hãy dừng upload trước khi đổi tài khoản' };
+  try { await rclone(['config', 'delete', 'drive'], 10000); } catch { /* chưa có remote */ }
+  return runRcloneInteractive(['config', 'create', 'drive', 'drive'], 'Đã cấu hình lại thành công!');
+});
+
+ipcMain.handle('reconnect-drive-remote', () => runRcloneInteractive(['config', 'reconnect', 'drive:'], 'Đã kết nối lại thành công!'));
+
+ipcMain.handle('open-url', (_, url) => {
+  if (typeof url === 'string' && /^https:\/\//.test(url)) return shell.openExternal(url);
+  return null;
+});
+
+ipcMain.handle('copy-text', (_, text) => { if (typeof text === 'string') clipboard.writeText(text); });
+
+ipcMain.handle('open-folder', (_, folderPath) => {
+  if (typeof folderPath === 'string' && fs.existsSync(folderPath)) return shell.openPath(folderPath);
+  return null;
+});
+
+// Tìm (hoặc tạo) thư mục đích trong thư mục Drive gốc, VD ["2026", "T11", "14/11 Bảo An"]
+ipcMain.handle('resolve-drive-target', async (_, rootId, segments) => {
+  if (!FOLDER_ID_RE.test(rootId || '')) return { success: false, message: 'Thư mục gốc không hợp lệ' };
+  if (!Array.isArray(segments) || !segments.length) return { success: false, message: 'Hãy nhập tên thư mục trên Drive' };
+  try {
+    const r = await resolveTarget((args) => rclone(args, 60000), rootId, segments);
+    return { success: true, ...r };
+  } catch (e) {
+    return { success: false, message: `Không tạo được thư mục trên Drive: ${(e.stderr || e.message || '').trim().split('\n').pop()}` };
+  }
+});
+
+ipcMain.handle('read-shoot-date', (_, folderPath) => {
+  if (typeof folderPath !== 'string') return { date: null, images: 0 };
+  return folderShootDate(folderPath);
+});
+
+ipcMain.handle('check-folder-access', async (_, folderId) => {
+  if (!FOLDER_ID_RE.test(folderId || '')) return { hasAccess: false, error: 'Folder ID không hợp lệ.' };
+  try {
+    await rclone(['lsf', 'drive:', '--drive-root-folder-id', folderId, '--max-depth', '1', '--dirs-only'], 20000);
+    return { hasAccess: true };
+  } catch {
+    return { hasAccess: false, error: 'Không có quyền truy cập folder này hoặc folder không tồn tại.' };
+  }
+});
+
 // ─── IPC: Monitoring ─────────────────────────────────────
+ipcMain.handle('get-state', () => ({
+  running: !!uploader,
+  historyId: currentHistoryId,
+  files: uploader ? uploader.getFileList() : [],
+  config: currentConfig,
+  stats: lastStats,
+  done: lastDone,
+}));
+
 ipcMain.handle('start-monitoring', (_, config) => {
-  if (isMonitoring) return { success: false, message: 'Đang theo dõi rồi' };
+  if (uploader) return { success: false, message: 'Đang theo dõi rồi' };
+  if (!config || typeof config.folderPath !== 'string' || !fs.existsSync(config.folderPath)) {
+    return { success: false, message: 'Folder không tồn tại' };
+  }
+  if (!FOLDER_ID_RE.test(config.folderId || '')) return { success: false, message: 'Folder ID không hợp lệ' };
 
-  currentConfig = config;
-  isMonitoring = true;
-  lastNewFileTime = Date.now();
-
-  // Init logger and read previous stats
-  sessionLogger.init(config.folderPath);
-  const prevUploaded = sessionLogger.getCumulativeUploadedCount();
-  const localCount = countLocalFiles(config.folderPath);
-
-  stats = {
-    total: localCount,
-    cumulativeUploaded: prevUploaded,
-    sessionUploaded: 0,
-    remaining: Math.max(0, localCount - prevUploaded),
+  allowedFolders.add(path.resolve(config.folderPath));
+  currentConfig = {
+    folderPath: config.folderPath,
+    folderId: config.folderId,
+    overwrite: !!config.overwrite,
+    autoSleep: !!config.autoSleep,
+    sleepMinutes: Number(config.sleepMinutes) || 0,
+    startFromName: (config.startFromName || '').trim(),
+    expectedTotal: Math.max(0, parseInt(config.expectedTotal, 10) || 0),
+    linkParentId: FOLDER_ID_RE.test(config.linkParentId || '') ? config.linkParentId : null,
+    linkName: typeof config.linkName === 'string' ? config.linkName.slice(0, 300) : null,
+    driveName: String(config.driveName || '').slice(0, 200),
   };
+  lastDone = null;
+  lastStats = null;
 
-  sessionLogger.startSession(config);
+  uploader = new Uploader({ ...currentConfig, env: shellEnv });
+  uploader.on('log', (msg, type) => sendLog(msg, type));
+  uploader.on('stats', onStats);
+  uploader.on('done', onDone);
+  uploader.on('files', (files) => send('files-update', files));
+  uploader.once('stopped', onStopped);
 
-  sendStatus('running');
-  sendLog('▶ Bắt đầu theo dõi');
-  sendLog(`📂 Folder: ${config.folderPath}`);
-  sendLog(`🔗 Drive ID: ${config.folderId}`);
-  if (prevUploaded > 0) {
-    sendLog(`📊 Phiên trước: đã upload ${prevUploaded}/${localCount} file`, 'info');
-  }
-  if (config.overwrite) sendLog('⚠️ Chế độ upload đè (overwrite) đang BẬT', 'warn');
-  sendLog('📝 Log file: appuploadanh-log.json', 'info');
-  sendStats();
+  send('status-change', 'running');
+  sendLog('▶ Bắt đầu theo dõi — ảnh sẽ được upload ngay khi export xong');
+  sendLog(`📂 Folder: ${currentConfig.folderPath}`);
+  sendLog(`🔗 Drive: ${config.driveName ? config.driveName + ' — ' : ''}${uploader.driveLink}`);
+  if (currentConfig.startFromName) sendLog(`⏭ Chỉ upload từ "${currentConfig.startFromName}" trở đi`, 'info');
+  if (currentConfig.overwrite) sendLog('⚠️ Upload đè đang BẬT: file trùng tên trên Drive sẽ bị thay', 'warn');
 
-  scanAndUpload(config);
+  const prev = UploadLog.summarize(currentConfig.folderPath, currentConfig.startFromName);
+  if (prev.cumulativeUploaded > 0) sendLog(`📊 Phiên trước: đã upload ${prev.cumulativeUploaded}/${prev.localCount} file`, 'info');
 
-  pollingInterval = setInterval(() => {
-    if (isMonitoring) scanAndUpload(config);
-  }, POLL_INTERVAL_MS);
+  loadSettings();
+  currentHistoryId = `job_${Date.now()}`;
+  settings.history.unshift({
+    id: currentHistoryId,
+    folderPath: currentConfig.folderPath,
+    folderName: path.basename(currentConfig.folderPath),
+    driveFolderId: currentConfig.folderId,
+    driveName: currentConfig.driveName,
+    linkParentId: currentConfig.linkParentId,
+    linkName: currentConfig.linkName,
+    link: uploader.driveLink,
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    uploaded: 0,
+    total: 0,
+    onDrive: 0,
+  });
+  settings.history = settings.history.slice(0, MAX_HISTORY);
+  saveSettings();
+  send('history-update', settings.history);
 
-  if (config.autoSleep && config.sleepMinutes > 0) {
-    sendLog(`😴 Auto-sleep: ${config.sleepMinutes} phút sau khi xong`, 'info');
-    startSleepTimer(config.sleepMinutes);
-  }
-
-  return { success: true };
+  uploader.start();
+  return { success: true, historyId: currentHistoryId };
 });
 
 ipcMain.handle('stop-monitoring', () => {
-  stopMonitoring();
-  sendLog('⏹ Dừng theo dõi');
+  stopUploader();
   return { success: true };
 });
 
 ipcMain.handle('cancel-upload', () => {
-  if (currentUploadProcess) {
-    currentUploadProcess.kill('SIGTERM');
-    currentUploadProcess = null;
-    scanLock = false;
-    sendLog('🛑 Đã huỷ upload đang chạy', 'warn');
+  if (uploader) {
+    sendLog('🛑 Huỷ ngay — dừng mọi upload đang chạy', 'warn');
+    uploader.cancel();
   }
   return { success: true };
 });
 
+ipcMain.handle('pause-upload', () => { if (uploader) uploader.pause(); return { success: true }; });
+ipcMain.handle('resume-upload', () => { if (uploader) uploader.resume(); return { success: true }; });
+
 ipcMain.handle('upload-now', () => {
-  if (!currentConfig) return { success: false, message: 'Chưa có phiên theo dõi' };
-  sendLog('⬆ Upload thủ công');
-  scanAndUpload(currentConfig);
+  if (!uploader) return { success: false, message: 'Chưa có phiên theo dõi' };
+  sendLog('🔎 Kiểm tra ngay: thử lại file lỗi và đối chiếu với Drive', 'info');
+  uploader.forceCheck();
   return { success: true };
 });
