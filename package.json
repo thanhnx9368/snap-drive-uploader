@@ -20,10 +20,15 @@
     "productName": "Snappy Drive",
     "files": [
       "main.js",
+      "uploader.js",
+      "exif.js",
+      "drive-target.js",
       "preload.js",
       "renderer.js",
       "index.html",
-      "styles.css"
+      "styles.css",
+      "assets/icon.png",
+      "assets/logo-mark.png"
     ],
     "mac": {
       "category": "public.app-category.utilities",
@@ -31,7 +36,7 @@
         "dmg",
         "zip"
       ],
-      "icon": "build/icon.icns"
+      "icon": "assets/icon.icns"
     },
     "dmg": {
       "title": "Snappy Drive",
